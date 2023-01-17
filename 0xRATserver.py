@@ -1,6 +1,5 @@
 from socket import *
 
-
 ip = "localhost"
 port = input("Server port:")
 port = int(port)
@@ -45,6 +44,6 @@ while True:
         else:
             client.send(Oxshell.encode())
     except error:
-        client.send(Oxshell.encode())
+        pass
 
 
