@@ -7,7 +7,7 @@ import distro
 
 
 
-os_info = distro.name()
+os_info = print(distro.like())
 
 os_user = getuser()
 general_info = f"Username:{os_user}\n\nOS:{os_info}"
