@@ -1,20 +1,46 @@
 from halo import Halo
 import subprocess
-import psutil
 import time
 
-subprocess.run(["pip", "install", "git+https://github.com/mmabrouk/chatgpt-wrapper"])
 
-subprocess.run(["playwright", "install", "firefox"])
-print("A window will open in a few seconds. Please log in it.")
-time.sleep(3)
-process = subprocess.Popen(["chatgpt", "install"])
-# User should log in to ChatGPT in the browser window
+first_time_check = input("first time to run 0xGPT ? (yes/no) :").lower()
 
-# Check if the process is running before killing it
-if psutil.pid_exists(process.pid):
-    process.kill()
+if first_time_check == "yes": 
+    
+   
+
+    subprocess.run(["sudo","pip", "install", "git+https://github.com/mmabrouk/chatgpt-wrapper"])
+
+    subprocess.run(["playwright", "install", "firefox"])
+
+    print("\nA window will open in a few seconds. Please log in it.")
+
+    time.sleep(3)
+
+    process = subprocess.Popen(["chatgpt", "install"])
+    
+    raise SystemExit
+    
 else:
-    print("Process not running")
+    
+    from chatgpt_wrapper import ChatGPT # type: ignore
+    
+    bot = ChatGPT()
+    
+    prompt = input("0xGPT>")
+    
+    spinner = Halo(text='Getting Stuff Together Bruv', spinner='dots')
+    
+    spinner.start()
+    
+    response = bot.ask(prompt)
+    
+    spinner.stop()
+    
+    print(response)
+    
+    spinner.succeed("All Done, Fam.")
+    
+    
+    
 
-subprocess.run(["chatgpt"])
