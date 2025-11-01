@@ -9,7 +9,7 @@ if first_time_check == "yes":
     
    
 
-    subprocess.run(["sudo","pip", "install", "git+https://github.com/mmabrouk/chatgpt-wrapper"])
+    subprocess.run(["pip", "install", "git+https://github.com/mmabrouk/chatgpt-wrapper","--break-system-packages"])
 
     subprocess.run(["playwright", "install", "firefox"])
 

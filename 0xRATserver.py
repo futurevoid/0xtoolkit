@@ -1,4 +1,4 @@
-from socket import *
+from socket import * # type: ignore
 
 ip = "localhost"
 port = input("Server port:")
