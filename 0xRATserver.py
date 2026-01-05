@@ -32,7 +32,7 @@ while True:
             client.send(Oxshell.encode())
             filedata = b""
             while True:
-                footer= client.recv(1024)
+                footer = client.recv(1024)
                 if footer == b"ENDBYTES":
                     print("done ;)")
                     break
