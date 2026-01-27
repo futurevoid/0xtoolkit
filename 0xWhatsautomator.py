@@ -8,6 +8,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 import time
 import os
 from datetime import datetime
+from urllib.parse import quote_plus
 # ============================================
 # EDIT THESE SETTINGS
 # ============================================
@@ -20,15 +21,71 @@ from datetime import datetime
 BROWSER_PATH = "/usr/bin/firedragon"
 
 # How long to wait between messages (in seconds)
-DELAY_BETWEEN_MESSAGES = 10
+DELAY_BETWEEN_MESSAGES = 15
 
 # Your phone numbers (with country code)
 PHONE_NUMBERS = [
+    +201030783589,
+    +201223944772,
+    +201065765379,
+    +201012813959,
+    +201126534319,
+    +201013108212,
+    +249124035850,
+    +201111309841,
+    +201055903512,
+    +201157688684,
+    +201100732370,
+    +201128948531,
+    +201558782590,
+    +201113638541,
+    +201158857766,
+    +201207184277,
+    +201064947323,
+    +201127678210,
+    +201220952829,
+    +201070326462,
+    +201017635248,
+    +201014291137,
+    +201282025093,
+    +201025217601,
+    +201285114000,
+    +201094700490,
+    +201033638711,
+    +201283468422,
+    +201099556793,
+    +201011326327,
+    +201143700150,
+    +966568957025,
+    +201289364411,
+    +201102147945,
+    +201150613806,
+    +201151523297,
+    +201031795155,
+    +201128904863,
+    +201223783198,
+    +201030741871,
+    +201221352872,
+    +201008735542,
+    +201015405748,
+    +201006532898,
+    +201557051217,
+    +213556857725,
+    +201143024013,
+    +201221637676,
+    +201119169321,
+    +201099104206,
+    +201206612032,
+    +201158583351,
+    +201155686430
 ]
-# Your message
-MESSAGE = """السلام عليكم ، حياك الله اخي الكريم 
-هل لحقت بالركب النبوي وسمعت المحاضرة ودخلت الإختبار يا طيب🤍"""
+  # Your message
+message_text = """
 
+
+"""
+
+MESSAGE = quote_plus(message_text)
 # ============================================
 # DON'T EDIT BELOW THIS LINE
 # ============================================
@@ -69,11 +126,12 @@ def open_whatsapp():
     
     return driver
 
-def send_message(driver, phone, message):
+def send_message(driver, phone, message=MESSAGE):
     """Send a message to one phone number"""
     try:
         # Open chat with this number
         url = f"https://web.whatsapp.com/send?phone={phone}&text={message}"
+        print(url)
         driver.get(url)
         time.sleep(15)
         
@@ -129,7 +187,7 @@ def main():
     for i, phone in enumerate(PHONE_NUMBERS, 1):
         write_log(f"\n[{i}/{len(PHONE_NUMBERS)}] Processing: {phone}")
         
-        if send_message(driver, phone, MESSAGE):
+        if send_message(driver, phone):
             success_count += 1
         else:
             fail_count += 1
