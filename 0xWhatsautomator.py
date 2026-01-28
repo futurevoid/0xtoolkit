@@ -8,7 +8,7 @@ from webdriver_manager.firefox import GeckoDriverManager
 import time
 import os
 from datetime import datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote
 # ============================================
 # EDIT THESE SETTINGS
 # ============================================
@@ -24,7 +24,12 @@ BROWSER_PATH = "/usr/bin/firedragon"
 DELAY_BETWEEN_MESSAGES = 15
 
 # Your phone numbers (with country code)
-PHONE_NUMBERS = [
+ 
+"""
+    +201030783589,
+    +201223944772,
+    """
+PHONE_NUMBERS =[
     +201030783589,
     +201223944772,
     +201065765379,
@@ -77,15 +82,26 @@ PHONE_NUMBERS = [
     +201099104206,
     +201206612032,
     +201158583351,
-    +201155686430
+    +201155686430,
+    +201099398421,
+    +201064277571,
+    +201001945746,
 ]
   # Your message
 message_text = """
-
+السلام عليكم ورحمة الله وبركاته 
+أخى... 
+اخبارك طمنا عليك يا حبيب 
+لعلك بخير 
+الحمد لله المحاضرة الخامسه نزلت 
+هل سمعتها واختبرت ؟
+واخبار الاوراد اى ؟
+اسأل الله ان يبارك فيك ويثبتك⚘️🤍
 
 """
+MESSAGE = quote(message_text)
 
-MESSAGE = quote_plus(message_text)
+
 # ============================================
 # DON'T EDIT BELOW THIS LINE
 # ============================================
@@ -121,7 +137,7 @@ def open_whatsapp():
     driver.get("https://web.whatsapp.com")
     
     print("\nPlease scan the QR code with your phone")
-    print("Waiting 30 seconds for you to login...")
+    print("Waiting 60 seconds for you to login...")
     time.sleep(60)
     
     return driver
