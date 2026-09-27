@@ -12,7 +12,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import time
 import os
 from datetime import datetime
-from urllib.parse import quote
 
 # ============================================
 # EDIT THESE SETTINGS
@@ -33,6 +32,19 @@ HEADLESS = False
 
 # How long to wait between messages (in seconds)
 DELAY_BETWEEN_MESSAGES = 15
+
+# CSS selectors WhatsApp Web uses for its message compose box, tried in order.
+# WhatsApp changes these periodically. If sending starts failing with "Couldn't
+# find the message box", open the browser (it's visible since HEADLESS=False),
+# right-click the message box -> Inspect, and add the new selector to the front
+# of this list.
+MESSAGE_BOX_SELECTORS = [
+    'div[contenteditable="true"][data-tab="10"]',
+    'div[aria-placeholder="Type a message"]',
+    'div[title="Type a message"]',
+    'footer div[contenteditable="true"]',
+    'div[contenteditable="true"][role="textbox"]',
+]
 
 # Your contacts (from the "تامر" sheet). Most are phone numbers with country
 # code; a few are WhatsApp @usernames (no phone number available) -- both work
@@ -114,7 +126,6 @@ message_text = """
 متنساش تقولي على اسم حضرتك عشان اسجله ❤️
 تالله يا حبيب لنزحفن سويا الي الجنة.
 """
-MESSAGE = quote(message_text)
 
 # ============================================
 # DON'T EDIT BELOW THIS LINE
@@ -145,43 +156,58 @@ def open_whatsapp(playwright):
     page = context.new_page()
     page.goto("https://web.whatsapp.com")
 
-    # If the persistent profile is already logged in, the chat list shows up fast.
-    # Otherwise, give the user time to scan the QR code.
-    try:
-        page.wait_for_selector('div[contenteditable="true"][data-tab="3"]', timeout=8000)
-        write_log("✓ Already logged in (persistent session)")
-    except PWTimeoutError:
-        write_log("\nPlease scan the QR code with your phone")
-        write_log("Waiting up to 60 seconds for you to log in...")
-        page.wait_for_selector('div[contenteditable="true"][data-tab="3"]', timeout=60000)
-        write_log("✓ Logged in")
+    # WhatsApp's DOM changes too often to reliably auto-detect "logged in" by
+    # CSS selector (that's what just timed out), so this asks you to confirm
+    # once instead. With the persistent profile above, you should only need
+    # to do this on the very first run -- after that WhatsApp Web should load
+    # already logged in.
+    write_log("\nIf a QR code appears, scan it with your phone.")
+    input("Once your chats have loaded, press Enter here to continue... ")
+    write_log("✓ Continuing")
 
     return context, page
 
 
 def get_message_box(page):
-    """Locate the message input box. Falls back to a looser selector since
-    WhatsApp occasionally changes its data-tab attribute numbers."""
-    try:
-        page.wait_for_selector('div[contenteditable="true"][data-tab="10"]', timeout=20000)
-        return page.locator('div[contenteditable="true"][data-tab="10"]')
-    except PWTimeoutError:
-        page.wait_for_selector('footer div[contenteditable="true"]', timeout=10000)
-        return page.locator('footer div[contenteditable="true"]').last
+    """Locate the message input box, trying each selector in
+    MESSAGE_BOX_SELECTORS in turn (see the comment above that list)."""
+    for selector in MESSAGE_BOX_SELECTORS:
+        try:
+            page.wait_for_selector(selector, timeout=8000)
+            return page.locator(selector).last
+        except PWTimeoutError:
+            continue
+    raise RuntimeError(
+        "Couldn't find the message box with any known selector. Right-click "
+        "the message box in the open browser -> Inspect, copy its selector, "
+        "and add it to MESSAGE_BOX_SELECTORS at the top of this script."
+    )
 
 
-def send_message(page, contact, message=MESSAGE):
+def send_message(page, contact, text=message_text):
     """Send a message to one contact (phone number or @username)"""
     try:
-        # wa.me handles both phone numbers and @usernames, text pre-filled via the URL
-        url = f"https://wa.me/{contact}?text={message}"
+        if contact.startswith("@"):
+            # web.whatsapp.com/send has no username parameter -- only wa.me
+            # can open a chat by username. No text goes through this URL
+            # though, so there's nothing here for a redirect to mangle.
+            url = f"https://wa.me/{contact}"
+        else:
+            # Phone numbers open fully through web.whatsapp.com, same as
+            # the original Selenium script.
+            url = f"https://web.whatsapp.com/send?phone={contact}"
         write_log(url)
         page.goto(url)
 
         # Wait for the message box instead of a blind sleep
         message_box = get_message_box(page)
-
         time.sleep(2)
+
+        # Type the message directly instead of pre-filling it via a URL
+        # parameter -- that's what was mangling the emoji.
+        message_box.click()
+        page.keyboard.insert_text(text)
+        time.sleep(1)
         message_box.press("Enter")
         write_log(f"✓ Sent to {contact}")
         return True
