@@ -48,7 +48,6 @@ MESSAGE_BOX_SELECTORS = [
 
 # Your contacts (from the "تامر" sheet). Most are phone numbers with country
 # code; a few are WhatsApp @usernames (no phone number available) -- both work
-# with the wa.me link format used below.
 CONTACTS = [
     "+201027561652",
     "+201222582650",
@@ -188,10 +187,11 @@ def send_message(page, contact, text=message_text):
     """Send a message to one contact (phone number or @username)"""
     try:
         if contact.startswith("@"):
-            # web.whatsapp.com/send has no username parameter -- only wa.me
+            contact = contact[1:]  # Remove the @ prefix
+            # web.whatsapp.com/send has username parameter
             # can open a chat by username. No text goes through this URL
             # though, so there's nothing here for a redirect to mangle.
-            url = f"https://wa.me/{contact}"
+            url = f"https://web.whatsapp.com/send/?username={contact}&type=username"
         else:
             # Phone numbers open fully through web.whatsapp.com, same as
             # the original Selenium script.
