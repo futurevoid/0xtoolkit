@@ -1,113 +1,127 @@
-# Install: pip install selenium webdriver-manager
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.firefox.service import Service
-from selenium.webdriver.firefox.options import Options
-from webdriver_manager.firefox import GeckoDriverManager
+"""
+0xWhatsautomator - Playwright edition
+Install:  pip install playwright
+Then either:
+  playwright install chromium      # downloads Playwright's bundled Chromium
+or, to drive your actual installed Google Chrome instead (recommended, matches
+what this script uses by default via BROWSER_CHANNEL = "chrome"):
+  playwright install-deps          # only needed once, installs OS-level deps
+"""
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import time
 import os
 from datetime import datetime
 from urllib.parse import quote
+
 # ============================================
 # EDIT THESE SETTINGS
 # ============================================
 
-# Path to your Firedragon browser (edit this to match your system)
-# Common locations:
-# Linux: "/usr/bin/firedragon" or "/usr/lib/firedragon/firedragon"
-# Windows: "C:\\Program Files\\Firedragon\\firedragon.exe"
-# If you're using regular Firefox instead, use: "/usr/bin/firefox"
-BROWSER_PATH = "/usr/bin/firedragon"
+# "chrome" drives your real installed Google Chrome (needs Chrome on PATH,
+# playwright finds it automatically once you've run `playwright install-deps`).
+# Set to None to use Playwright's own bundled Chromium instead.
+BROWSER_CHANNEL = "chrome"
+
+# Folder where the browser profile (and your WhatsApp Web login) is kept.
+# Unlike the old Selenium version, this makes the login PERSIST between runs
+# -- scan the QR code once, and future runs skip straight past it.
+USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".whatsapp_automator_profile")
+
+# Run with a visible browser window (needed the first time, to scan the QR code)
+HEADLESS = False
 
 # How long to wait between messages (in seconds)
 DELAY_BETWEEN_MESSAGES = 15
 
-# Your phone numbers (with country code)
- 
-"""
-    +201030783589,
-    +201223944772,
-    """
-PHONE_NUMBERS =[
-    +201030783589,
-    +201223944772,
-    +201065765379,
-    +201012813959,
-    +201126534319,
-    +201013108212,
-    +249124035850,
-    +201111309841,
-    +201055903512,
-    +201157688684,
-    +201100732370,
-    +201128948531,
-    +201558782590,
-    +201113638541,
-    +201158857766,
-    +201207184277,
-    +201064947323,
-    +201127678210,
-    +201220952829,
-    +201070326462,
-    +201017635248,
-    +201014291137,
-    +201282025093,
-    +201025217601,
-    +201285114000,
-    +201094700490,
-    +201033638711,
-    +201283468422,
-    +201099556793,
-    +201011326327,
-    +201143700150,
-    +966568957025,
-    +201289364411,
-    +201102147945,
-    +201150613806,
-    +201151523297,
-    +201031795155,
-    +201128904863,
-    +201223783198,
-    +201030741871,
-    +201221352872,
-    +201008735542,
-    +201015405748,
-    +201006532898,
-    +201557051217,
-    +213556857725,
-    +201143024013,
-    +201221637676,
-    +201119169321,
-    +201099104206,
-    +201206612032,
-    +201158583351,
-    +201155686430,
-    +201099398421,
-    +201064277571,
-    +201001945746,
+# Your contacts (from the "تامر" sheet). Most are phone numbers with country
+# code; a few are WhatsApp @usernames (no phone number available) -- both work
+# with the wa.me link format used below.
+CONTACTS = [
+    "+201027561652",
+    "+201222582650",
+    "+201153279134",
+    "+249902288788",
+    "+201156783081",
+    "+201116872327",
+    "+972592729543",
+    "+201552866834",
+    "+201096141207",
+    "+201276721393",
+    "@mandooood",
+    "+201096192295",
+    "+201145187674",
+    "+971521477122",
+    "+966562537752",
+    "+201149767798",
+    "+201203893117",
+    "+966597667077",
+    "+201011644941",
+    "+218934536455",
+    "+201015453456",
+    "+201551432466",
+    "+201020742864",
+    "+201120410022",
+    "+201142800788",
+    "+923136996392",
+    "+201023014484",
+    "+584268415091",
+    "+201068464188",
+    "+201105831650",
+    "@MrAhmedMansour1793",
+    "+201127565075",
+    "+201036156620",
+    "@Ahmed.Abd.ELfatttah",
+    "+971561595646",
+    "@Papajohns_marina.4",
+    "+201558091111",
+    "+201117804450",
+    "+201004785469",
+    "+201500047787",
+    "+201206826783",
+    "+201110343035",
+    "+201018558418",
+    "+201156662691",
+    "+201129392465",
+    "+972569101707",
+    "+966564837012",
+    "+201066456621",
+    "+201158695533",
+    "@youssefalmotassem",
+    "@youssef_alsaudi0",
+    "+962781608060",
 ]
-  # Your message
-message_text = """
-السلام عليكم ورحمة الله وبركاته 
-أخى... 
-اخبارك طمنا عليك يا حبيب 
-لعلك بخير 
-الحمد لله المحاضرة الخامسه نزلت 
-هل سمعتها واختبرت ؟
-واخبار الاوراد اى ؟
-اسأل الله ان يبارك فيك ويثبتك⚘️🤍
 
+# Your message
+message_text = """
+السلام عليكم ورحمة الله
+
+*أهلاً وسهلاً بك من جديد في ضبط مصنع 🌹*
+
+
+معك أخوك فى الله ( تامر السعيد )
+ من قسم المتابعة الخاص بالدورة مجموعة *٣٤* 😍
+
+باذن الله سأكون بصحبتك على مدار رحلتنا الطيبة للرد على كل الإستفسارات و إزالة كل العقبات قدر المستطاع لحصاد الثمار الطيبة من هذه الدورة الطيبة🌾
+📌وماتنساش تطمني بنتيجة الإختبارات أولاً بأول 😊
+
+زادكم الله فى الخير أعوام ونفع الله بكم البلاد و العباد 🤲
+------------------------------
+محتاجين نكون من الاوائل وده نعمله ان شاء الله عن طريق سماع المحاضرة كل جمعه الساعه 9 على اليوتيوب
+ والامتحان بينزل الفجر نصلي الفجر ونمتحن وبكدا ان شاء الله نكون من الاوائل 😉🤍
+هيا يا حبيب تالله لنزحفن سويا الي الجنة ❤️❤️
+------------------------------
+متنساش تقولي على اسم حضرتك عشان اسجله ❤️
+تالله يا حبيب لنزحفن سويا الي الجنة.
 """
 MESSAGE = quote(message_text)
-
 
 # ============================================
 # DON'T EDIT BELOW THIS LINE
 # ============================================
 
-# Create log file
 LOG_FILE = f"whatsapp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
 
 def write_log(message):
     """Write a message to both console and log file"""
@@ -115,134 +129,131 @@ def write_log(message):
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
 
-def open_whatsapp():
-    """Open WhatsApp Web in Firefox/Firedragon"""
-    print("Opening WhatsApp Web...")
-    
-    # Setup Firefox/Firedragon options
-    options = Options()
-    
-    # Check if browser path exists
-    BROWSER_PATH = "/usr/bin/firedragon"  # Change this to your actual path
-    if os.path.exists(BROWSER_PATH):
-        options.binary_location = BROWSER_PATH
-        print(f"Using browser: {BROWSER_PATH}")
-    else:
-        print(f"⚠️  Warning: Browser not found at {BROWSER_PATH}")
-        print("Trying default Firefox location...")
-    
-    # Create driver
-    service = Service(GeckoDriverManager().install())
-    driver = webdriver.Firefox(service=service, options=options)
-    driver.get("https://web.whatsapp.com")
-    
-    print("\nPlease scan the QR code with your phone")
-    print("Waiting 60 seconds for you to login...")
-    time.sleep(60)
-    
-    return driver
 
-def send_message(driver, phone, message=MESSAGE):
-    """Send a message to one phone number"""
+def open_whatsapp(playwright):
+    """Launch Chrome with a persistent profile and open WhatsApp Web"""
+    write_log("Opening WhatsApp Web...")
+
+    launch_kwargs = {"headless": HEADLESS}
+    if BROWSER_CHANNEL:
+        launch_kwargs["channel"] = BROWSER_CHANNEL
+        write_log(f"Using browser channel: {BROWSER_CHANNEL}")
+    else:
+        write_log("Using Playwright's bundled Chromium")
+
+    context = playwright.chromium.launch_persistent_context(USER_DATA_DIR, **launch_kwargs)
+    page = context.new_page()
+    page.goto("https://web.whatsapp.com")
+
+    # If the persistent profile is already logged in, the chat list shows up fast.
+    # Otherwise, give the user time to scan the QR code.
     try:
-        # Open chat with this number
-        url = f"https://web.whatsapp.com/send?phone={phone}&text={message}"
-        print(url)
-        driver.get(url)
-        time.sleep(15)
-        
-        # Find the message box
-        message_box = driver.find_element(By.XPATH, '//div[@contenteditable="true"][@data-tab="10"]')
-        
-        # Type the message (line by line to keep formatting)
-        #lines = message.split('\n')
-        #for i, line in enumerate(lines):
-        #    message_box.send_keys(line)
-        #    if i < len(lines) - 1:
-        #        message_box.send_keys(Keys.SHIFT + Keys.ENTER)
-        
-        # Send the message
+        page.wait_for_selector('div[contenteditable="true"][data-tab="3"]', timeout=8000)
+        write_log("✓ Already logged in (persistent session)")
+    except PWTimeoutError:
+        write_log("\nPlease scan the QR code with your phone")
+        write_log("Waiting up to 60 seconds for you to log in...")
+        page.wait_for_selector('div[contenteditable="true"][data-tab="3"]', timeout=60000)
+        write_log("✓ Logged in")
+
+    return context, page
+
+
+def get_message_box(page):
+    """Locate the message input box. Falls back to a looser selector since
+    WhatsApp occasionally changes its data-tab attribute numbers."""
+    try:
+        page.wait_for_selector('div[contenteditable="true"][data-tab="10"]', timeout=20000)
+        return page.locator('div[contenteditable="true"][data-tab="10"]')
+    except PWTimeoutError:
+        page.wait_for_selector('footer div[contenteditable="true"]', timeout=10000)
+        return page.locator('footer div[contenteditable="true"]').last
+
+
+def send_message(page, contact, message=MESSAGE):
+    """Send a message to one contact (phone number or @username)"""
+    try:
+        # wa.me handles both phone numbers and @usernames, text pre-filled via the URL
+        url = f"https://wa.me/{contact}?text={message}"
+        write_log(url)
+        page.goto(url)
+
+        # Wait for the message box instead of a blind sleep
+        message_box = get_message_box(page)
+
         time.sleep(2)
-        message_box.send_keys(Keys.ENTER)
-        
-        print(f"✓ Sent to {phone}")
+        message_box.press("Enter")
+        write_log(f"✓ Sent to {contact}")
         return True
-        
     except Exception as e:
-        print(f"✗ Failed to send to {phone}: {e}")
+        write_log(f"✗ Failed to send to {contact}: {e}")
         return False
+
 
 def main():
     """Main function - runs everything"""
-    write_log("="*50)
-    write_log("WhatsApp Bulk Sender - Starting")
-    write_log("="*50)
-    write_log(f"Total numbers: {len(PHONE_NUMBERS)}")
+    write_log("=" * 50)
+    write_log("WhatsApp Bulk Sender (Playwright) - Starting")
+    write_log("=" * 50)
+    write_log(f"Total contacts: {len(CONTACTS)}")
     write_log(f"Delay between messages: {DELAY_BETWEEN_MESSAGES} seconds")
     write_log(f"Log file: {LOG_FILE}")
-    write_log("="*50)
-    
-    # Ask user to confirm
+    write_log("=" * 50)
+
     response = input("\nStart sending? (y/n): ").lower()
     if response != 'y':
         write_log("❌ CANCELLED by user")
         return
-    
+
     write_log("✓ User confirmed - Starting process...")
     start_time = datetime.now()
     write_log(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Open WhatsApp
-    driver = open_whatsapp()
-    
-    # Send to each number
-    success_count = 0
-    fail_count = 0
-    failed_numbers = []
-    
-    for i, phone in enumerate(PHONE_NUMBERS, 1):
-        write_log(f"\n[{i}/{len(PHONE_NUMBERS)}] Processing: {phone}")
-        
-        if send_message(driver, phone):
-            success_count += 1
-        else:
-            fail_count += 1
-            failed_numbers.append(phone)
-        
-        # Wait before next message (except for last one)
-        if i < len(PHONE_NUMBERS):
-            write_log(f"⏸️  Waiting {DELAY_BETWEEN_MESSAGES} seconds...")
-            time.sleep(DELAY_BETWEEN_MESSAGES)
-    
-    # Calculate duration
-    end_time = datetime.now()
-    duration = end_time - start_time
-    
-    # Show results
-    write_log("\n" + "="*50)
-    write_log("FINAL REPORT")
-    write_log("="*50)
-    write_log(f"✓ Successful: {success_count}")
-    write_log(f"✗ Failed: {fail_count}")
-    write_log(f"📊 Success Rate: {(success_count/len(PHONE_NUMBERS)*100):.1f}%")
-    write_log(f"⏱️  Duration: {duration}")
-    write_log(f"🕐 End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    if failed_numbers:
-        write_log("\n❌ Failed Numbers List:")
-        for phone in failed_numbers:
-            write_log(f"   • {phone}")
-    
-    write_log("="*50)
-    write_log(f"📄 Full log saved to: {LOG_FILE}")
-    write_log("="*50)
-    
-    # Keep browser open for 10 seconds
-    write_log("\nClosing browser in 10 seconds...")
-    time.sleep(10)
-    driver.quit()
-    write_log("✓ Browser closed - Process complete!")
 
-# Run the script
+    with sync_playwright() as playwright:
+        context, page = open_whatsapp(playwright)
+
+        success_count = 0
+        fail_count = 0
+        failed_contacts = []
+
+        for i, contact in enumerate(CONTACTS, 1):
+            write_log(f"\n[{i}/{len(CONTACTS)}] Processing: {contact}")
+            if send_message(page, contact):
+                success_count += 1
+            else:
+                fail_count += 1
+                failed_contacts.append(contact)
+
+            if i < len(CONTACTS):
+                write_log(f"⏸️ Waiting {DELAY_BETWEEN_MESSAGES} seconds...")
+                time.sleep(DELAY_BETWEEN_MESSAGES)
+
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        write_log("\n" + "=" * 50)
+        write_log("FINAL REPORT")
+        write_log("=" * 50)
+        write_log(f"✓ Successful: {success_count}")
+        write_log(f"✗ Failed: {fail_count}")
+        write_log(f"📊 Success Rate: {(success_count / len(CONTACTS) * 100):.1f}%")
+        write_log(f"⏱️ Duration: {duration}")
+        write_log(f"🕐 End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        if failed_contacts:
+            write_log("\n❌ Failed Contacts List:")
+            for contact in failed_contacts:
+                write_log(f"  • {contact}")
+
+        write_log("=" * 50)
+        write_log(f"📄 Full log saved to: {LOG_FILE}")
+        write_log("=" * 50)
+
+        write_log("\nClosing browser in 10 seconds...")
+        time.sleep(10)
+        context.close()
+        write_log("✓ Browser closed - Process complete!")
+
+
 if __name__ == "__main__":
     main()
