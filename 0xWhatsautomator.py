@@ -11,6 +11,7 @@ what this script uses by default via BROWSER_CHANNEL = "chrome"):
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import time
 import os
+import random
 from datetime import datetime
 
 # ============================================
@@ -30,8 +31,14 @@ USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".whatsapp_automator_profi
 # Run with a visible browser window (needed the first time, to scan the QR code)
 HEADLESS = False
 
-# How long to wait between messages (in seconds)
-DELAY_BETWEEN_MESSAGES = 15
+# Delay between messages, in seconds. Randomized within this range each time
+# instead of a fixed number -- sending at a perfectly identical interval is
+# itself a pattern anti-spam systems look for.
+DELAY_RANGE = (25, 55)
+
+# Every this many messages, take one longer break, like a person would.
+LONG_BREAK_EVERY = 10
+LONG_BREAK_RANGE = (120, 240)  # seconds
 
 # CSS selectors WhatsApp Web uses for its message compose box, tried in order.
 # WhatsApp changes these periodically. If sending starts failing with "Couldn't
@@ -48,6 +55,7 @@ MESSAGE_BOX_SELECTORS = [
 
 # Your contacts (from the "تامر" sheet). Most are phone numbers with country
 # code; a few are WhatsApp @usernames (no phone number available) -- both work
+# with the wa.me link format used below.
 CONTACTS = [
     "+201027561652",
     "+201222582650",
@@ -183,15 +191,27 @@ def get_message_box(page):
     )
 
 
+def human_type(page, text):
+    """Type text with human-like, uneven pacing instead of pasting it all at
+    once -- a bit longer at line breaks and punctuation, like someone actually
+    composing the message."""
+    for ch in text:
+        page.keyboard.insert_text(ch)
+        if ch in "\n.،؟!؛":
+            time.sleep(random.uniform(0.25, 0.7))
+        else:
+            time.sleep(random.uniform(0.02, 0.09))
+
+
 def send_message(page, contact, text=message_text):
     """Send a message to one contact (phone number or @username)"""
     try:
         if contact.startswith("@"):
-            contact = contact[1:]  # Remove the @ prefix
-            # web.whatsapp.com/send has username parameter
-            # can open a chat by username. No text goes through this URL
-            # though, so there's nothing here for a redirect to mangle.
-            url = f"https://web.whatsapp.com/send/?username={contact}&type=username"
+            username = contact[1:]  # strip the leading @
+            # web.whatsapp.com/send supports opening a chat by username too,
+            # via type=username -- no text passed through this URL, so
+            # there's nothing here for a redirect to mangle either way.
+            url = f"https://web.whatsapp.com/send/?username={username}&type=username"
         else:
             # Phone numbers open fully through web.whatsapp.com, same as
             # the original Selenium script.
@@ -201,13 +221,15 @@ def send_message(page, contact, text=message_text):
 
         # Wait for the message box instead of a blind sleep
         message_box = get_message_box(page)
-        time.sleep(2)
 
-        # Type the message directly instead of pre-filling it via a URL
-        # parameter -- that's what was mangling the emoji.
+        # Pause as if reading the chat before starting to type
+        time.sleep(random.uniform(1.5, 4.0))
+
         message_box.click()
-        page.keyboard.insert_text(text)
-        time.sleep(1)
+        human_type(page, text)
+
+        # Pause as if reviewing the message before sending
+        time.sleep(random.uniform(0.8, 2.5))
         message_box.press("Enter")
         write_log(f"✓ Sent to {contact}")
         return True
@@ -222,7 +244,7 @@ def main():
     write_log("WhatsApp Bulk Sender (Playwright) - Starting")
     write_log("=" * 50)
     write_log(f"Total contacts: {len(CONTACTS)}")
-    write_log(f"Delay between messages: {DELAY_BETWEEN_MESSAGES} seconds")
+    write_log(f"Delay between messages: {DELAY_RANGE[0]}-{DELAY_RANGE[1]}s (randomized)")
     write_log(f"Log file: {LOG_FILE}")
     write_log("=" * 50)
 
@@ -251,8 +273,13 @@ def main():
                 failed_contacts.append(contact)
 
             if i < len(CONTACTS):
-                write_log(f"⏸️ Waiting {DELAY_BETWEEN_MESSAGES} seconds...")
-                time.sleep(DELAY_BETWEEN_MESSAGES)
+                if i % LONG_BREAK_EVERY == 0:
+                    pause = random.uniform(*LONG_BREAK_RANGE)
+                    write_log(f"⏸️ Taking a longer break: {pause:.0f}s...")
+                else:
+                    pause = random.uniform(*DELAY_RANGE)
+                    write_log(f"⏸️ Waiting {pause:.0f}s...")
+                time.sleep(pause)
 
         end_time = datetime.now()
         duration = end_time - start_time
