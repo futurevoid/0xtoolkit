@@ -112,7 +112,7 @@ CONTACTS = [
 ]
 
 # Your message
-message_text = """
+message = """
 السلام عليكم ورحمة الله
 
 *أهلاً وسهلاً بك من جديد في ضبط مصنع 🌹*
@@ -141,11 +141,11 @@ message_text = """
 LOG_FILE = f"whatsapp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
 
-def write_log(message):
+def write_log(entry):
     """Write a message to both console and log file"""
-    print(message)
+    print(entry)
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {entry}\n")
 
 
 def open_whatsapp(playwright):
@@ -203,8 +203,9 @@ def human_type(page, text):
             time.sleep(random.uniform(0.02, 0.09))
 
 
-def send_message(page, contact, text=message_text):
-    """Send a message to one contact (phone number or @username)"""
+def send_message(page, contact):
+    """Send the `message` variable to one contact (phone number or @username).
+    The text is typed straight from `message` -- the clipboard is never used."""
     try:
         if contact.startswith("@"):
             username = contact[1:]  # strip the leading @
@@ -226,7 +227,7 @@ def send_message(page, contact, text=message_text):
         time.sleep(random.uniform(1.5, 4.0))
 
         message_box.click()
-        human_type(page, text)
+        human_type(page, message)
 
         # Pause as if reviewing the message before sending
         time.sleep(random.uniform(0.8, 2.5))
