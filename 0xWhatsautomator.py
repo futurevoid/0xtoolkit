@@ -191,21 +191,20 @@ def get_message_box(page):
     )
 
 
-def human_type(page, text):
-    """Type text with human-like, uneven pacing instead of pasting it all at
-    once -- a bit longer at line breaks and punctuation, like someone actually
-    composing the message."""
-    for ch in text:
-        page.keyboard.insert_text(ch)
-        if ch in "\n.،؟!؛":
-            time.sleep(random.uniform(0.25, 0.7))
-        else:
-            time.sleep(random.uniform(0.02, 0.09))
+def type_message(page):
+    """Type the `message` variable into the focused compose box. The clipboard
+    is never used. Line breaks are entered as Shift+Enter so they stay inside
+    the message instead of sending it."""
+    lines = message.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            page.keyboard.insert_text(line)
+        if i < len(lines) - 1:
+            page.keyboard.press("Shift+Enter")
 
 
 def send_message(page, contact):
-    """Send the `message` variable to one contact (phone number or @username).
-    The text is typed straight from `message` -- the clipboard is never used."""
+    """Send the `message` variable to one contact (phone number or @username)"""
     try:
         if contact.startswith("@"):
             username = contact[1:]  # strip the leading @
@@ -227,7 +226,7 @@ def send_message(page, contact):
         time.sleep(random.uniform(1.5, 4.0))
 
         message_box.click()
-        human_type(page, message)
+        type_message(page)
 
         # Pause as if reviewing the message before sending
         time.sleep(random.uniform(0.8, 2.5))
