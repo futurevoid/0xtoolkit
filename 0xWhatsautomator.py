@@ -2,7 +2,8 @@
 0xWhatsautomator - Playwright edition
 
 Sends `message` (below) to every contact in CONTACTS through WhatsApp Web,
-fully automatically and in the background (no browser window, no prompts).
+fully automatically: no prompts, and the browser window minimizes itself and
+keeps sending while minimized or behind other windows.
 
 Install once:
   pip install playwright
@@ -11,9 +12,12 @@ Install once:
 Run:
   python 0xWhatsautomator.py
 
-First run only: a browser window opens with the WhatsApp QR code. Scan it with
-your phone (WhatsApp -> Linked devices -> Link a device); the window closes
-itself and everything else runs in the background. Later runs need nothing.
+First run only: scan the QR code shown in the browser window with your phone
+(WhatsApp -> Linked devices -> Link a device). The login is saved, so later
+runs need nothing from you.
+
+Check what was sent: whatsapp_sent_proof/ has, per contact, the exact text
+typed before sending and the text of the sent chat bubble.
 
 Every contact that got the message is saved to whatsapp_sent_contacts.txt and
 skipped next time, so if a run is interrupted, just run it again. Delete that
@@ -40,14 +44,16 @@ BROWSER_CHANNEL = "chrome"
 # -- scan the QR code once, and future runs skip straight past it.
 USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".whatsapp_automator_profile")
 
-# True = send fully in the background with no browser window.
-# If you're not logged in yet, a visible window opens ONLY to show the QR
-# code: scan it with your phone (WhatsApp -> Linked devices -> Link a device),
-# the window closes by itself and sending continues in the background. The
-# login is kept in USER_DATA_DIR, so later runs need no window at all.
-# False = keep the browser window visible the whole time (it still works
-# while minimized or behind other windows -- never click on it).
-HEADLESS = True
+# False = normal browser window (recommended). It works while minimized or
+# behind other windows -- you never need to click on it or keep it in front.
+# True = no window at all. If you're not logged in yet, a window opens ONLY to
+# show the QR code, then sending continues with no window.
+HEADLESS = False
+
+# Minimize the window automatically once WhatsApp is logged in (the window
+# stays open for the QR code if you need to scan it first). Sending works the
+# same minimized; restore the window any time to watch it.
+START_MINIMIZED = True
 
 # Max time to wait for WhatsApp Web to load / for the QR code to be scanned.
 LOGIN_TIMEOUT = 300  # seconds
@@ -73,6 +79,15 @@ LINK_PREVIEW_WAIT = 4
 
 # True = type the message into each chat but DON'T send it (for testing).
 DRY_RUN = False
+
+# Proof of exactly what was sent, saved per contact into this folder:
+#   <contact>.txt          -- the text in the message box right before sending,
+#                             and the text of the sent bubble in the chat after
+#   <contact>_1_before_send.png / <contact>_2_sent.png -- screenshots, only
+#                             when the window isn't minimized (a minimized
+#                             window can't be captured)
+# None = off.
+PROOF_DIR = "whatsapp_sent_proof"
 
 # Contacts that got the message are written to this file. On the next run
 # they are skipped, so a crash or Ctrl+C never makes anyone get it twice.
@@ -180,6 +195,13 @@ LOG_FILE = f"whatsapp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 # no WhatsApp account (English and Arabic interface)
 INVALID_NUMBER_TEXTS = ["invalid", "غير صالح", "غير صحيح"]
 
+# Outgoing message bubbles in an open chat (to read back what was sent)
+SENT_BUBBLE_SELECTORS = [
+    'div.message-out span.selectable-text',
+    'div.message-out .copyable-text span',
+    'div.message-out',
+]
+
 # Something on screen that only exists once you're logged in (chat list etc.)
 LOGGED_IN_SELECTORS = [
     '#pane-side',
@@ -201,8 +223,24 @@ BROWSER_ARGS = [
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
     "--disable-background-timer-throttling",
+    "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
     "--disable-blink-features=AutomationControlled",
 ]
+
+# Runs in WhatsApp's page before its own code: the page always sees itself as
+# visible and focused, so a minimized/covered window behaves exactly like one
+# in front (WhatsApp pauses some work in hidden tabs).
+ALWAYS_VISIBLE_JS = """
+Object.defineProperty(Document.prototype, 'visibilityState', {get: () => 'visible'});
+Object.defineProperty(Document.prototype, 'hidden', {get: () => false});
+Object.defineProperty(Document.prototype, 'webkitVisibilityState', {get: () => 'visible'});
+Object.defineProperty(Document.prototype, 'webkitHidden', {get: () => false});
+Document.prototype.hasFocus = () => true;
+for (const type of ['visibilitychange', 'webkitvisibilitychange', 'blur', 'pagehide', 'freeze']) {
+  window.addEventListener(type, e => { if (e.target === window || e.target === document) e.stopImmediatePropagation(); }, true);
+  document.addEventListener(type, e => e.stopImmediatePropagation(), true);
+}
+"""
 
 
 class NotLoggedInError(Exception):
@@ -230,6 +268,55 @@ def normalize(text):
     line breaks and spaces."""
     text = text.replace(" ", " ").replace("\r", "")
     return "\n".join(line.strip() for line in text.strip().split("\n"))
+
+
+def proof_path(contact, suffix):
+    os.makedirs(PROOF_DIR, exist_ok=True)
+    name = "".join(ch if ch.isalnum() else "_" for ch in contact.lstrip("+@"))
+    return os.path.join(PROOF_DIR, name + suffix)
+
+
+def is_minimized(page):
+    try:
+        cdp = page.context.new_cdp_session(page)
+        window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
+        state = cdp.send("Browser.getWindowBounds", {"windowId": window_id})["bounds"]["windowState"]
+        cdp.detach()
+        return state == "minimized"
+    except Exception:
+        return False
+
+
+def save_proof(page, contact, step, text):
+    """Record what was typed / sent (see PROOF_DIR); never fails the send."""
+    if not PROOF_DIR:
+        return
+    try:
+        with open(proof_path(contact, ".txt"), "a", encoding="utf-8") as f:
+            f.write(f"===== {step} ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) =====\n")
+            f.write(text + "\n\n")
+        if not is_minimized(page):
+            page.screenshot(path=proof_path(contact, f"_{step}.png"), timeout=5000)
+    except Exception as e:
+        write_log(f"  (couldn't save proof: {str(e).splitlines()[0]})")
+
+
+def last_sent_bubble_text(page):
+    """Text of the newest outgoing message in the open chat, or None."""
+    for selector in SENT_BUBBLE_SELECTORS:
+        try:
+            bubbles = page.locator(selector)
+            if bubbles.count():
+                return normalize(bubbles.last.inner_text(timeout=3000))
+        except Exception:
+            pass
+    return None
+
+
+def plain(text):
+    """Text without WhatsApp formatting marks (*bold* _italic_ ~strike~ `code`)
+    or whitespace -- for comparing with what the chat bubble displays."""
+    return "".join(ch for ch in text if ch not in "*_~`" and not ch.isspace())
 
 
 def load_sent_contacts():
@@ -291,12 +378,25 @@ def launch_browser(playwright, headless):
                     user_agent=user_agent.replace("HeadlessChrome", "Chrome"), **kwargs)
                 page = context.pages[0] if context.pages else context.new_page()
 
+        context.add_init_script(ALWAYS_VISIBLE_JS)
         # Accept any "leave site? changes may not be saved" prompt, otherwise
         # it silently blocks the navigation to the next contact.
         page.on("dialog", lambda dialog: dialog.accept())
         write_log(f"Browser: {channel} ({'background' if headless else 'visible window'})")
         return context, page
     raise RuntimeError(f"Couldn't start any browser: {last_error}")
+
+
+def minimize_window(page):
+    """Minimize the browser window (sending keeps working while minimized)."""
+    try:
+        cdp = page.context.new_cdp_session(page)
+        window_id = cdp.send("Browser.getWindowForTarget")["windowId"]
+        cdp.send("Browser.setWindowBounds",
+                 {"windowId": window_id, "bounds": {"windowState": "minimized"}})
+        write_log("Window minimized -- sending continues in the background")
+    except Exception as e:
+        write_log(f"(couldn't minimize the window: {e})")
 
 
 def check_login(page, wait_for_scan):
@@ -328,19 +428,20 @@ def check_login(page, wait_for_scan):
 
 
 def open_whatsapp(playwright):
-    """Open WhatsApp Web logged in. Shows a window only if a QR scan is
-    needed, then continues in the background (when HEADLESS = True)."""
+    """Open WhatsApp Web logged in (waiting for a QR scan if needed)."""
     write_log("Opening WhatsApp Web...")
     context, page = launch_browser(playwright, HEADLESS)
     if check_login(page, wait_for_scan=not HEADLESS):
         write_log("✓ Logged in")
+        if not HEADLESS and START_MINIMIZED:
+            minimize_window(page)
         return context, page
 
     if not HEADLESS:
         context.close()
         raise NotLoggedInError(f"QR code wasn't scanned within {LOGIN_TIMEOUT}s")
 
-    # Not logged in: show a window just for the QR code.
+    # Headless and not logged in: show a window just for the QR code.
     context.close()
     write_log("Not logged in yet -- opening a window to scan the QR code...")
     context, page = launch_browser(playwright, headless=False)
@@ -450,6 +551,8 @@ def send_message(page, contact):
         # Pause as if reviewing the message before sending
         time.sleep(random.uniform(0.8, 2.5))
 
+        save_proof(page, contact, "1_before_send", box_text(box))
+
         if DRY_RUN:
             write_log(f"✓ [DRY RUN] Message typed for {contact}, not sent")
             clear_box(page, box)
@@ -467,6 +570,19 @@ def send_message(page, contact):
 
         # Let WhatsApp hand the message off before navigating away
         time.sleep(2)
+        bubble = last_sent_bubble_text(page)
+        if bubble is None:
+            save_proof(page, contact, "2_sent", "(couldn't read the sent bubble from the chat)")
+        else:
+            save_proof(page, contact, "2_sent", bubble)
+            # The bubble shows formatting instead of the * _ ~ ` marks and adds
+            # the time, so check it contains the whole message once those are
+            # ignored.
+            if plain(expected) in plain(bubble):
+                write_log("  ✓ chat shows the exact message")
+            else:
+                write_log("  ⚠ the last sent bubble differs from the message -- check "
+                          + proof_path(contact, ".txt"))
         write_log(f"✓ Sent to {contact}")
         return True
     except NotLoggedInError:
