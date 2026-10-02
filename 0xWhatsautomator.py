@@ -1,11 +1,23 @@
 """
 0xWhatsautomator - Playwright edition
-Install:  pip install playwright
-Then either:
-  playwright install chromium      # downloads Playwright's bundled Chromium
-or, to drive your actual installed Google Chrome instead (recommended, matches
-what this script uses by default via BROWSER_CHANNEL = "chrome"):
-  playwright install-deps          # only needed once, installs OS-level deps
+
+Sends `message` (below) to every contact in CONTACTS through WhatsApp Web,
+fully automatically and in the background (no browser window, no prompts).
+
+Install once:
+  pip install playwright
+  playwright install chromium     # fallback browser if Google Chrome isn't installed
+
+Run:
+  python 0xWhatsautomator.py
+
+First run only: a browser window opens with the WhatsApp QR code. Scan it with
+your phone (WhatsApp -> Linked devices -> Link a device); the window closes
+itself and everything else runs in the background. Later runs need nothing.
+
+Every contact that got the message is saved to whatsapp_sent_contacts.txt and
+skipped next time, so if a run is interrupted, just run it again. Delete that
+file to send a NEW message to everyone.
 """
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -28,8 +40,20 @@ BROWSER_CHANNEL = "chrome"
 # -- scan the QR code once, and future runs skip straight past it.
 USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".whatsapp_automator_profile")
 
-# Run with a visible browser window (needed the first time, to scan the QR code)
-HEADLESS = False
+# True = send fully in the background with no browser window.
+# If you're not logged in yet, a visible window opens ONLY to show the QR
+# code: scan it with your phone (WhatsApp -> Linked devices -> Link a device),
+# the window closes by itself and sending continues in the background. The
+# login is kept in USER_DATA_DIR, so later runs need no window at all.
+# False = keep the browser window visible the whole time (it still works
+# while minimized or behind other windows -- never click on it).
+HEADLESS = True
+
+# Max time to wait for WhatsApp Web to load / for the QR code to be scanned.
+LOGIN_TIMEOUT = 300  # seconds
+
+# True = ask "Start sending? (y/n)" before starting. False = fully automatic.
+CONFIRM_BEFORE_SENDING = False
 
 # Delay between messages, in seconds. Randomized within this range each time
 # instead of a fixed number -- sending at a perfectly identical interval is
@@ -39,6 +63,22 @@ DELAY_RANGE = (25, 55)
 # Every this many messages, take one longer break, like a person would.
 LONG_BREAK_EVERY = 10
 LONG_BREAK_RANGE = (120, 240)  # seconds
+
+# How long to wait for a chat to open after loading its link, in seconds.
+CHAT_LOAD_TIMEOUT = 40
+
+# Seconds to wait after typing before sending when the message contains a
+# link, so WhatsApp finishes building the link preview.
+LINK_PREVIEW_WAIT = 4
+
+# True = type the message into each chat but DON'T send it (for testing).
+DRY_RUN = False
+
+# Contacts that got the message are written to this file. On the next run
+# they are skipped, so a crash or Ctrl+C never makes anyone get it twice.
+# Delete the file (or set SKIP_ALREADY_SENT = False) to send to everyone again.
+SENT_FILE = "whatsapp_sent_contacts.txt"
+SKIP_ALREADY_SENT = True
 
 # CSS selectors WhatsApp Web uses for its message compose box, tried in order.
 # WhatsApp changes these periodically. If sending starts failing with "Couldn't
@@ -136,6 +176,46 @@ https://forms.gle/yakkWjrAbtj6H6Me9
 
 LOG_FILE = f"whatsapp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
+# Words in the popup WhatsApp Web shows when the number in the /send URL has
+# no WhatsApp account (English and Arabic interface)
+INVALID_NUMBER_TEXTS = ["invalid", "غير صالح", "غير صحيح"]
+
+# Something on screen that only exists once you're logged in (chat list etc.)
+LOGGED_IN_SELECTORS = [
+    '#pane-side',
+    '#side',
+    'div[aria-label="Chat list"]',
+    'div[aria-label="قائمة الدردشات"]',
+    '[data-icon="new-chat-outline"]',
+]
+
+# The login QR code
+QR_SELECTORS = [
+    'canvas[aria-label*="QR"]',
+    'canvas[aria-label*="scan" i]',
+    'div[data-ref] canvas',
+]
+
+# Keep Chrome running at full speed when it's headless, minimized or covered
+BROWSER_ARGS = [
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-blink-features=AutomationControlled",
+]
+
+
+class NotLoggedInError(Exception):
+    pass
+
+
+# Send button, used only if pressing Enter didn't send the message
+SEND_BUTTON_SELECTORS = [
+    'button[aria-label="Send"]',
+    'span[data-icon="send"]',
+    'span[data-icon="wds-ic-send-filled"]',
+]
+
 
 def write_log(entry):
     """Write a message to both console and log file"""
@@ -144,149 +224,349 @@ def write_log(entry):
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {entry}\n")
 
 
-def open_whatsapp(playwright):
-    """Launch Chrome with a persistent profile and open WhatsApp Web"""
-    write_log("Opening WhatsApp Web...")
+def normalize(text):
+    """Collapse a message to its visible lines, so what's in the compose box
+    can be compared with `message` regardless of how the editor stores
+    line breaks and spaces."""
+    text = text.replace(" ", " ").replace("\r", "")
+    return "\n".join(line.strip() for line in text.strip().split("\n"))
 
-    launch_kwargs = {"headless": HEADLESS}
-    if BROWSER_CHANNEL:
-        launch_kwargs["channel"] = BROWSER_CHANNEL
-        write_log(f"Using browser channel: {BROWSER_CHANNEL}")
+
+def load_sent_contacts():
+    if not os.path.exists(SENT_FILE):
+        return set()
+    with open(SENT_FILE, encoding='utf-8') as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def mark_sent(contact):
+    with open(SENT_FILE, 'a', encoding='utf-8') as f:
+        f.write(contact + "\n")
+
+
+def any_visible(page, selectors):
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() and loc.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def launch_browser(playwright, headless):
+    """Start Chrome (or the bundled Chromium as a fallback) on the saved
+    profile and return (context, page)."""
+    channels = [BROWSER_CHANNEL] if BROWSER_CHANNEL else []
+    if "chromium" not in channels:
+        channels.append("chromium")
+
+    kwargs = {"headless": headless, "args": BROWSER_ARGS}
+    if headless:
+        kwargs["viewport"] = {"width": 1366, "height": 900}
     else:
-        write_log("Using Playwright's bundled Chromium")
+        kwargs["no_viewport"] = True
 
-    context = playwright.chromium.launch_persistent_context(USER_DATA_DIR, **launch_kwargs)
-    page = context.new_page()
+    last_error = None
+    for channel in channels:
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                USER_DATA_DIR, channel=channel, **kwargs)
+        except Exception as e:
+            last_error = e
+            write_log(f"Couldn't start browser '{channel}', trying the next one "
+                      f"({str(e).splitlines()[0]})")
+            continue
+
+        page = context.pages[0] if context.pages else context.new_page()
+        if headless:
+            # Headless Chrome calls itself "HeadlessChrome", which WhatsApp
+            # Web rejects. Restart it presenting the normal Chrome name.
+            user_agent = page.evaluate("navigator.userAgent")
+            if "HeadlessChrome" in user_agent:
+                context.close()
+                context = playwright.chromium.launch_persistent_context(
+                    USER_DATA_DIR, channel=channel,
+                    user_agent=user_agent.replace("HeadlessChrome", "Chrome"), **kwargs)
+                page = context.pages[0] if context.pages else context.new_page()
+
+        # Accept any "leave site? changes may not be saved" prompt, otherwise
+        # it silently blocks the navigation to the next contact.
+        page.on("dialog", lambda dialog: dialog.accept())
+        write_log(f"Browser: {channel} ({'background' if headless else 'visible window'})")
+        return context, page
+    raise RuntimeError(f"Couldn't start any browser: {last_error}")
+
+
+def check_login(page, wait_for_scan):
+    """Load WhatsApp Web and return True once logged in. If the QR code is
+    showing: return False right away, or (wait_for_scan=True) wait for it to
+    be scanned."""
     page.goto("https://web.whatsapp.com")
+    deadline = time.time() + LOGIN_TIMEOUT
+    asked = False
+    no_qr_since = time.time()
+    while time.time() < deadline:
+        if any_visible(page, LOGGED_IN_SELECTORS):
+            return True
+        if any_visible(page, QR_SELECTORS):
+            no_qr_since = time.time()
+            if not wait_for_scan:
+                return False
+            if not asked:
+                write_log("\n📱 Scan the QR code in the browser window with your phone:")
+                write_log("   WhatsApp -> Settings -> Linked devices -> Link a device")
+                asked = True
+        elif time.time() - no_qr_since > 45:
+            # WhatsApp has been loading for 45s without asking for a QR scan,
+            # so the session is logged in even though none of the known
+            # chat-list selectors matched (WhatsApp renames them sometimes).
+            return True
+        time.sleep(1)
+    return False
 
-    # WhatsApp's DOM changes too often to reliably auto-detect "logged in" by
-    # CSS selector (that's what just timed out), so this asks you to confirm
-    # once instead. With the persistent profile above, you should only need
-    # to do this on the very first run -- after that WhatsApp Web should load
-    # already logged in.
-    write_log("\nIf a QR code appears, scan it with your phone.")
-    input("Once your chats have loaded, press Enter here to continue... ")
-    write_log("✓ Continuing")
 
+def open_whatsapp(playwright):
+    """Open WhatsApp Web logged in. Shows a window only if a QR scan is
+    needed, then continues in the background (when HEADLESS = True)."""
+    write_log("Opening WhatsApp Web...")
+    context, page = launch_browser(playwright, HEADLESS)
+    if check_login(page, wait_for_scan=not HEADLESS):
+        write_log("✓ Logged in")
+        return context, page
+
+    if not HEADLESS:
+        context.close()
+        raise NotLoggedInError(f"QR code wasn't scanned within {LOGIN_TIMEOUT}s")
+
+    # Not logged in: show a window just for the QR code.
+    context.close()
+    write_log("Not logged in yet -- opening a window to scan the QR code...")
+    context, page = launch_browser(playwright, headless=False)
+    if not check_login(page, wait_for_scan=True):
+        context.close()
+        raise NotLoggedInError(f"QR code wasn't scanned within {LOGIN_TIMEOUT}s")
+    write_log("✓ Logged in -- letting WhatsApp finish syncing...")
+    time.sleep(15)
+    context.close()
+
+    write_log("Continuing in the background...")
+    context, page = launch_browser(playwright, headless=True)
+    if not check_login(page, wait_for_scan=False):
+        context.close()
+        raise NotLoggedInError("login didn't stick after scanning, run the script again")
+    write_log("✓ Logged in")
     return context, page
 
 
 def get_message_box(page):
-    """Locate the message input box, trying each selector in
-    MESSAGE_BOX_SELECTORS in turn (see the comment above that list)."""
-    for selector in MESSAGE_BOX_SELECTORS:
+    """Wait for the chat to open and return its compose box. Raises if the
+    number isn't on WhatsApp or the box can't be found."""
+    deadline = time.time() + CHAT_LOAD_TIMEOUT
+    while time.time() < deadline:
+        for selector in MESSAGE_BOX_SELECTORS:
+            box = page.locator(selector).last
+            try:
+                if box.count() and box.is_visible():
+                    return box
+            except Exception:
+                pass
+        if any_visible(page, QR_SELECTORS):
+            raise NotLoggedInError("WhatsApp logged out (QR code is showing)")
         try:
-            page.wait_for_selector(selector, timeout=8000)
-            return page.locator(selector).last
+            popup = page.locator('div[role="dialog"]')
+            popup_text = popup.first.inner_text().lower() if popup.count() else ""
+            if any(word in popup_text for word in INVALID_NUMBER_TEXTS):
+                raise RuntimeError("number is not on WhatsApp (invalid number popup)")
         except PWTimeoutError:
-            continue
+            pass
+        time.sleep(0.5)
     raise RuntimeError(
-        "Couldn't find the message box with any known selector. Right-click "
-        "the message box in the open browser -> Inspect, copy its selector, "
-        "and add it to MESSAGE_BOX_SELECTORS at the top of this script."
+        f"chat didn't open within {CHAT_LOAD_TIMEOUT}s. If WhatsApp is loaded "
+        "but this keeps happening, right-click the message box -> Inspect, "
+        "and add its selector to the front of MESSAGE_BOX_SELECTORS."
     )
 
 
-def type_message(page):
-    """Type the `message` variable into the focused compose box. The clipboard
-    is never used. Line breaks are entered as Shift+Enter so they stay inside
-    the message instead of sending it."""
-    lines = message.split("\n")
+def clear_box(page, box):
+    box.click()
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
+
+
+def box_text(box):
+    return normalize(box.inner_text())
+
+
+def type_message(page, box):
+    """Type the `message` variable into the compose box (never the clipboard).
+    Line breaks are entered with Shift+Enter so they don't send early."""
+    box.click()
+    lines = normalize(message).split("\n")
     for i, line in enumerate(lines):
         if line:
             page.keyboard.insert_text(line)
+            time.sleep(random.uniform(0.05, 0.25))
         if i < len(lines) - 1:
             page.keyboard.press("Shift+Enter")
 
 
 def send_message(page, contact):
-    """Send the `message` variable to one contact (phone number or @username)"""
+    """Send the `message` variable to one contact (phone number or @username).
+    Returns True only once the message has actually left the compose box."""
     try:
         if contact.startswith("@"):
-            username = contact[1:]  # strip the leading @
-            # web.whatsapp.com/send supports opening a chat by username too,
-            # via type=username -- no text passed through this URL, so
-            # there's nothing here for a redirect to mangle either way.
-            url = f"https://web.whatsapp.com/send/?username={username}&type=username"
+            url = f"https://web.whatsapp.com/send/?username={contact[1:]}&type=username"
         else:
-            # Phone numbers open fully through web.whatsapp.com, same as
-            # the original Selenium script.
-            url = f"https://web.whatsapp.com/send?phone={contact}"
+            url = f"https://web.whatsapp.com/send?phone={contact.lstrip('+')}"
         write_log(url)
         page.goto(url)
 
-        # Wait for the message box instead of a blind sleep
-        message_box = get_message_box(page)
+        box = get_message_box(page)
 
         # Pause as if reading the chat before starting to type
         time.sleep(random.uniform(1.5, 4.0))
 
-        message_box.click()
-        type_message(page)
+        # Make sure the box holds exactly `message` -- clear any leftover
+        # draft first, and retype if anything came out wrong.
+        expected = normalize(message)
+        for attempt in range(1, 4):
+            if box_text(box):
+                clear_box(page, box)
+            type_message(page, box)
+            if box_text(box) == expected:
+                break
+            write_log(f"  typed text didn't match the message (attempt {attempt}), retyping")
+        else:
+            clear_box(page, box)
+            raise RuntimeError("couldn't type the message correctly, NOT sent")
+
+        # Links in the message make WhatsApp load a preview; give it time so
+        # Enter isn't swallowed while it loads.
+        if "http" in message:
+            time.sleep(LINK_PREVIEW_WAIT)
 
         # Pause as if reviewing the message before sending
         time.sleep(random.uniform(0.8, 2.5))
-        message_box.press("Enter")
+
+        if DRY_RUN:
+            write_log(f"✓ [DRY RUN] Message typed for {contact}, not sent")
+            clear_box(page, box)
+            return True
+
+        box.press("Enter")
+        if not wait_until_sent(box):
+            for selector in SEND_BUTTON_SELECTORS:
+                button = page.locator(selector).last
+                if button.count() and button.is_visible():
+                    button.click()
+                    break
+            if not wait_until_sent(box):
+                raise RuntimeError("message is still in the box after Enter and Send button")
+
+        # Let WhatsApp hand the message off before navigating away
+        time.sleep(2)
         write_log(f"✓ Sent to {contact}")
         return True
+    except NotLoggedInError:
+        raise
     except Exception as e:
         write_log(f"✗ Failed to send to {contact}: {e}")
         return False
 
 
+def wait_until_sent(box, timeout=10):
+    """A sent message leaves the compose box empty."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if not box_text(box):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
 def main():
     """Main function - runs everything"""
+    already_sent = load_sent_contacts() if SKIP_ALREADY_SENT else set()
+    pending = [c for c in CONTACTS if c not in already_sent]
+
     write_log("=" * 50)
     write_log("WhatsApp Bulk Sender (Playwright) - Starting")
     write_log("=" * 50)
     write_log(f"Total contacts: {len(CONTACTS)}")
+    if already_sent:
+        write_log(f"Skipping {len(CONTACTS) - len(pending)} already sent (listed in {SENT_FILE})")
+    write_log(f"To send now: {len(pending)}")
+    if DRY_RUN:
+        write_log("DRY RUN: messages will be typed but NOT sent")
     write_log(f"Delay between messages: {DELAY_RANGE[0]}-{DELAY_RANGE[1]}s (randomized)")
     write_log(f"Log file: {LOG_FILE}")
     write_log("=" * 50)
+    write_log("Message preview:\n" + normalize(message))
+    write_log("=" * 50)
 
-    response = input("\nStart sending? (y/n): ").lower()
-    if response != 'y':
-        write_log("❌ CANCELLED by user")
+    if not pending:
+        write_log(f"Nothing to send. Delete {SENT_FILE} to send to everyone again.")
         return
 
-    write_log("✓ User confirmed - Starting process...")
+    if CONFIRM_BEFORE_SENDING:
+        response = input("\nStart sending? (y/n): ").strip().lower()
+        if response != 'y':
+            write_log("❌ CANCELLED by user")
+            return
+
     start_time = datetime.now()
     write_log(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     with sync_playwright() as playwright:
-        context, page = open_whatsapp(playwright)
+        try:
+            context, page = open_whatsapp(playwright)
+        except NotLoggedInError as e:
+            write_log(f"❌ Not logged in: {e}. Nothing was sent.")
+            return
 
         success_count = 0
-        fail_count = 0
         failed_contacts = []
 
-        for i, contact in enumerate(CONTACTS, 1):
-            write_log(f"\n[{i}/{len(CONTACTS)}] Processing: {contact}")
-            if send_message(page, contact):
-                success_count += 1
-            else:
-                fail_count += 1
-                failed_contacts.append(contact)
-
-            if i < len(CONTACTS):
-                if i % LONG_BREAK_EVERY == 0:
-                    pause = random.uniform(*LONG_BREAK_RANGE)
-                    write_log(f"⏸️ Taking a longer break: {pause:.0f}s...")
+        try:
+            for i, contact in enumerate(pending, 1):
+                write_log(f"\n[{i}/{len(pending)}] Processing: {contact}")
+                if send_message(page, contact):
+                    success_count += 1
+                    if not DRY_RUN:
+                        mark_sent(contact)
                 else:
-                    pause = random.uniform(*DELAY_RANGE)
-                    write_log(f"⏸️ Waiting {pause:.0f}s...")
-                time.sleep(pause)
+                    failed_contacts.append(contact)
+
+                if i < len(pending):
+                    if i % LONG_BREAK_EVERY == 0:
+                        pause = random.uniform(*LONG_BREAK_RANGE)
+                        write_log(f"⏸️ Taking a longer break: {pause:.0f}s...")
+                    else:
+                        pause = random.uniform(*DELAY_RANGE)
+                        write_log(f"⏸️ Waiting {pause:.0f}s...")
+                    time.sleep(pause)
+        except KeyboardInterrupt:
+            write_log("\n⛔ Stopped by user (Ctrl+C). Re-run to continue where it left off.")
+        except NotLoggedInError as e:
+            write_log(f"\n⛔ Stopped: {e}. Run the script again to log in and continue "
+                      "where it left off.")
 
         end_time = datetime.now()
-        duration = end_time - start_time
+        attempted = success_count + len(failed_contacts)
 
         write_log("\n" + "=" * 50)
         write_log("FINAL REPORT")
         write_log("=" * 50)
         write_log(f"✓ Successful: {success_count}")
-        write_log(f"✗ Failed: {fail_count}")
-        write_log(f"📊 Success Rate: {(success_count / len(CONTACTS) * 100):.1f}%")
-        write_log(f"⏱️ Duration: {duration}")
+        write_log(f"✗ Failed: {len(failed_contacts)}")
+        if attempted:
+            write_log(f"📊 Success Rate: {(success_count / attempted * 100):.1f}%")
+        write_log(f"⏱️ Duration: {end_time - start_time}")
         write_log(f"🕐 End time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         if failed_contacts:
@@ -298,8 +578,8 @@ def main():
         write_log(f"📄 Full log saved to: {LOG_FILE}")
         write_log("=" * 50)
 
-        write_log("\nClosing browser in 10 seconds...")
-        time.sleep(10)
+        write_log("\nClosing browser...")
+        time.sleep(5)
         context.close()
         write_log("✓ Browser closed - Process complete!")
 
