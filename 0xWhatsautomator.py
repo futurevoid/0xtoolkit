@@ -250,6 +250,31 @@ HISTORY_PRESENT_JS = """() => {
 HISTORY_MESSAGES_TO_CHECK = 50
 HISTORY_LOAD_WAIT = 8  # seconds
 
+# WhatsApp only shows the newest few messages of a chat; the script scrolls up
+# until it has at least this many to check (or reaches the start of the chat).
+MIN_MESSAGES_TO_CHECK = 10
+
+# Scrolls the open chat's message list (the tallest scrollable box in #main)
+# up by one screen. Returns "moved", "top" (already at the top -- WhatsApp is
+# nudged to load older messages) or "none" (no scrollable list found).
+SCROLL_CHAT_UP_JS = """() => {
+    const root = document.querySelector('#main') || document.body;
+    let best = null;
+    for (const el of root.querySelectorAll('div')) {
+        const style = getComputedStyle(el);
+        if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 10 &&
+            (!best || el.scrollHeight > best.scrollHeight)) best = el;
+    }
+    if (!best) return 'none';
+    if (best.scrollTop <= 0) {
+        best.dispatchEvent(new Event('scroll'));
+        return 'top';
+    }
+    best.scrollTop = Math.max(0, best.scrollTop - best.clientHeight);
+    best.dispatchEvent(new Event('scroll'));
+    return 'moved';
+}"""
+
 # The "Read more" link on long messages (English and Arabic interface)
 READ_MORE_WORDS = r"(read more|قراءة المزيد|اقرأ المزيد|عرض المزيد|المزيد)"
 READ_MORE_PATTERN = re.compile(READ_MORE_WORDS + r"\s*$", re.I)
@@ -526,9 +551,40 @@ def wait_for_history(page):
     return False
 
 
+def load_older_messages(page):
+    """Scroll the chat up until at least MIN_MESSAGES_TO_CHECK messages are
+    loaded, or the start of the chat is reached."""
+    count = len(chat_messages(page))
+    fruitless = 0
+    for _ in range(20):
+        if count >= MIN_MESSAGES_TO_CHECK:
+            return
+        try:
+            where = page.evaluate(SCROLL_CHAT_UP_JS)
+        except Exception:
+            where = "none"
+        # WhatsApp loads older messages as you scroll; give it up to 3s
+        deadline = time.time() + 3
+        new_count = count
+        while time.time() < deadline:
+            time.sleep(0.5)
+            new_count = len(chat_messages(page))
+            if new_count > count:
+                break
+        if new_count > count:
+            count, fruitless = new_count, 0
+        elif where in ("top", "none"):
+            return  # start of the chat (or nothing to scroll): all loaded
+        else:
+            fruitless += 1
+            if fruitless >= 4:
+                return
+
+
 def already_in_chat(page, contact):
     """True if `message` is already among the latest messages in this chat."""
     wait_for_history(page)
+    load_older_messages(page)
     expand_read_more(page)
     messages = chat_messages(page)
     # Any message in the chat counts (not only ones marked as yours), so a
@@ -540,7 +596,11 @@ def already_in_chat(page, contact):
         write_log(f"  checked the last {len(messages)} message(s) in this chat "
                   f"({mine} sent by you): this message wasn't sent before")
         save_proof(page, contact, "chat_before_send",
-                   "\n----------\n".join(m["text"] for m in messages[-3:]))
+                   "\n----------\n".join(m["text"] for m in messages[-MIN_MESSAGES_TO_CHECK:]))
+        if len(messages) < MIN_MESSAGES_TO_CHECK or not mine:
+            # fewer than expected, or none recognised as yours: keep the page
+            # structure so the reading can be fixed for your WhatsApp version
+            dump_chat_dom(page, contact)
     elif history_present(page):
         write_log("  ⚠ the chat has messages but they couldn't be read -- "
                   "relying on the sent record only")
