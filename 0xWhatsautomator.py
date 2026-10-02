@@ -206,16 +206,44 @@ LOG_FILE = f"whatsapp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 # no WhatsApp account (English and Arabic interface)
 INVALID_NUMBER_TEXTS = ["invalid", "غير صالح", "غير صحيح"]
 
-# Outgoing message bubbles in an open chat (to read back what was sent)
-# (each selector matches one element per message: the outermost text holder)
-SENT_BUBBLE_SELECTORS = [
-    'div.message-out div.copyable-text:not(div.copyable-text *)',
-    'div.message-out span.selectable-text:not(span.selectable-text *)',
-    'div.message-out',
-]
+# Reads the messages of the open chat (oldest first) as [{text, out}], where
+# out = sent by you. Finds messages by what WhatsApp needs for its own copy and
+# reply features rather than by class names, which it renames:
+#   [data-pre-plain-text]  -- on every text message ("[time, date] Name: ")
+#   [data-id]              -- on every message row, starting "true_" if yours
+# with the old div.message-out / div.message-in classes as a fallback.
+CHAT_MESSAGES_JS = """(limit) => {
+    const read = el => {
+        const copy = el.cloneNode(true);
+        copy.querySelectorAll('img').forEach(img =>
+            img.replaceWith(document.createTextNode(img.alt || img.getAttribute('data-plain-text') || '')));
+        copy.querySelectorAll('br').forEach(br => br.replaceWith(document.createTextNode('\\n')));
+        copy.querySelectorAll('p, div, li').forEach(b => b.append(document.createTextNode('\\n')));
+        return copy.textContent;
+    };
+    const root = document.querySelector('#main') || document.body;
+    let nodes = [];
+    for (const sel of ['[data-pre-plain-text]', '.message-out, .message-in',
+                       '[data-id^="true_"], [data-id^="false_"]']) {
+        nodes = [...root.querySelectorAll(sel)];
+        if (nodes.length) break;
+    }
+    nodes = nodes.filter(n => !nodes.some(o => o !== n && o.contains(n)));   // whole messages only
+    return nodes.slice(-limit).map(n => {
+        const row = n.closest('[data-id]');
+        const id = row ? row.getAttribute('data-id') || '' : '';
+        const out = id.startsWith('true_') || !!n.closest('.message-out');
+        return {text: read(n), out: out};
+    });
+}"""
 
-# Any message row (yours or theirs), to know the chat history has loaded
-MESSAGE_ROW_SELECTOR = 'div.message-out, div.message-in'
+# Anything that shows the open chat has message history on screen
+HISTORY_PRESENT_JS = """() => {
+    const root = document.querySelector('#main');
+    const inRoot = root ? root.querySelectorAll('[data-pre-plain-text], [data-id], [role="row"]').length : 0;
+    return inRoot + document.querySelectorAll(
+        '[data-pre-plain-text], .message-out, .message-in, [data-id^="true_"], [data-id^="false_"]').length;
+}"""
 
 # How many of your latest sent messages in the chat are checked, and how long
 # to wait for the chat history to appear before checking.
@@ -360,10 +388,14 @@ def save_proof(page, contact, step, text):
 
 
 def last_sent_bubble_text(page):
-    """Text of the newest outgoing message in the open chat, or None."""
+    """Text of the newest message you sent in the open chat, or None."""
     expand_read_more(page)
-    bubbles = sent_bubbles(page)
-    return bubbles[-1] if bubbles else None
+    messages = chat_messages(page)
+    mine = [m["text"] for m in messages if m["out"]]
+    if mine:
+        return mine[-1]
+    # direction unknown: right after sending, the newest message is ours
+    return messages[-1]["text"] if messages else None
 
 
 def plain(text):
@@ -407,29 +439,55 @@ def mark_sent(contact):
 def expand_read_more(page):
     """WhatsApp cuts long messages short behind "Read more"; open them all."""
     try:
-        links = page.locator("div.message-out").get_by_text(READ_MORE_LINK)
+        area = page.locator("#main") if page.locator("#main").count() else page
+        links = area.get_by_text(READ_MORE_LINK)
         for i in range(min(links.count(), 20)):
             try:
                 links.nth(i).click(timeout=2000)
             except Exception:
                 pass
+        if links.count():
+            time.sleep(0.5)
     except Exception:
         pass
 
 
-def sent_bubbles(page):
-    """Texts of your latest sent messages in the open chat (newest last).
-    Empty list if none could be read."""
-    for selector in SENT_BUBBLE_SELECTORS:
-        try:
-            bubbles = page.locator(selector)
-            count = bubbles.count()
-            if count:
-                return [read_text(bubbles.nth(i))
-                        for i in range(max(0, count - HISTORY_MESSAGES_TO_CHECK), count)]
-        except Exception:
-            pass
-    return []
+def chat_messages(page):
+    """Latest messages of the open chat as [{"text", "out"}] (see CHAT_MESSAGES_JS)."""
+    try:
+        messages = page.evaluate(CHAT_MESSAGES_JS, HISTORY_MESSAGES_TO_CHECK)
+    except Exception:
+        return []
+    for m in messages:
+        text = "".join(ch for ch in m["text"] if ch not in INVISIBLE_CHARS)
+        m["text"] = "\n".join(line for line in normalize(text).split("\n") if line)
+    return [m for m in messages if m["text"]]
+
+
+def history_present(page):
+    try:
+        return page.evaluate(HISTORY_PRESENT_JS) > 0
+    except Exception:
+        return False
+
+
+DOM_DUMPS_LEFT = [3]
+
+
+def dump_chat_dom(page, contact):
+    """Save the open chat's page structure (a few per run) so the selectors can
+    be fixed if WhatsApp changed its layout."""
+    if not PROOF_DIR or DOM_DUMPS_LEFT[0] <= 0:
+        return
+    DOM_DUMPS_LEFT[0] -= 1
+    try:
+        html = page.evaluate("() => (document.querySelector('#main') || document.body).outerHTML")
+        path = proof_path(contact, "_chat_page.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html[:400000])
+        write_log(f"  saved the chat's page structure to {path}")
+    except Exception:
+        pass
 
 
 def fingerprint(text):
@@ -461,35 +519,35 @@ def wait_for_history(page):
     """Give the chat history time to appear (new chats have none)."""
     deadline = time.time() + HISTORY_LOAD_WAIT
     while time.time() < deadline:
-        try:
-            if page.locator(MESSAGE_ROW_SELECTOR).count():
-                time.sleep(1.5)  # let the rest of the visible history render
-                return
-        except Exception:
-            pass
+        if history_present(page):
+            time.sleep(1.5)  # let the rest of the visible history render
+            return True
         time.sleep(0.5)
+    return False
 
 
 def already_in_chat(page, contact):
-    """True if `message` is already among your latest sent messages here."""
+    """True if `message` is already among the latest messages in this chat."""
     wait_for_history(page)
     expand_read_more(page)
-    bubbles = sent_bubbles(page)
-    if any(same_message(b) for b in bubbles):
+    messages = chat_messages(page)
+    # Any message in the chat counts (not only ones marked as yours), so a
+    # missed "sent by you" marker can never cause a duplicate.
+    if any(same_message(m["text"]) for m in messages):
         return True
-    try:
-        rows = page.locator(MESSAGE_ROW_SELECTOR).count()
-    except Exception:
-        rows = 0
-    if bubbles:
-        write_log(f"  checked your last {len(bubbles)} sent message(s) in this chat: not sent before")
+    if messages:
+        mine = sum(1 for m in messages if m["out"])
+        write_log(f"  checked the last {len(messages)} message(s) in this chat "
+                  f"({mine} sent by you): this message wasn't sent before")
         save_proof(page, contact, "chat_before_send",
-                   "\n----------\n".join(bubbles[-3:]))
-    elif rows:
-        write_log("  ⚠ the chat has messages but none of yours could be read -- "
+                   "\n----------\n".join(m["text"] for m in messages[-3:]))
+    elif history_present(page):
+        write_log("  ⚠ the chat has messages but they couldn't be read -- "
                   "relying on the sent record only")
+        dump_chat_dom(page, contact)
     else:
-        write_log("  new chat (no earlier messages)")
+        write_log("  no earlier messages found in this chat")
+        dump_chat_dom(page, contact)
     return False
 
 
