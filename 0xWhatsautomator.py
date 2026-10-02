@@ -19,15 +19,18 @@ runs need nothing from you.
 Check what was sent: whatsapp_sent_proof/ has, per contact, the exact text
 typed before sending and the text of the sent chat bubble.
 
-Every contact that got the message is saved to whatsapp_sent_contacts.txt and
-skipped next time, so if a run is interrupted, just run it again. Delete that
-file to send a NEW message to everyone.
+No double sends: a contact is skipped if they already got this exact message
+(recorded in whatsapp_sent_contacts.txt, and checked in the chat itself before
+typing). If a run is interrupted, just run it again. Change `message` and
+everyone gets the new one -- nothing to delete.
 """
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import time
 import os
 import random
+import re
+import hashlib
 from datetime import datetime
 
 # ============================================
@@ -89,9 +92,13 @@ DRY_RUN = False
 # None = off.
 PROOF_DIR = "whatsapp_sent_proof"
 
-# Contacts that got the message are written to this file. On the next run
-# they are skipped, so a crash or Ctrl+C never makes anyone get it twice.
-# Delete the file (or set SKIP_ALREADY_SENT = False) to send to everyone again.
+# Never send the same message to the same contact twice. Two checks:
+#  1. Every contact that gets `message` is recorded in SENT_FILE together with
+#     a fingerprint of the message; they're skipped on later runs. Change
+#     `message` and everyone gets the new one -- nothing to delete.
+#  2. Before typing, the chat itself is checked: if this exact message is
+#     already among your sent messages there (sent by an earlier run, from
+#     another computer, or by hand), the contact is skipped.
 SENT_FILE = "whatsapp_sent_contacts.txt"
 SKIP_ALREADY_SENT = True
 
@@ -202,6 +209,9 @@ SENT_BUBBLE_SELECTORS = [
     'div.message-out',
 ]
 
+# The "Read more" link on long messages (English and Arabic interface)
+READ_MORE_PATTERN = re.compile(r"^\s*(read more|قراءة المزيد|اقرأ المزيد|عرض المزيد)\s*$", re.I)
+
 # Something on screen that only exists once you're logged in (chat list etc.)
 LOGGED_IN_SELECTORS = [
     '#pane-side',
@@ -303,14 +313,9 @@ def save_proof(page, contact, step, text):
 
 def last_sent_bubble_text(page):
     """Text of the newest outgoing message in the open chat, or None."""
-    for selector in SENT_BUBBLE_SELECTORS:
-        try:
-            bubbles = page.locator(selector)
-            if bubbles.count():
-                return normalize(bubbles.last.inner_text(timeout=3000))
-        except Exception:
-            pass
-    return None
+    expand_read_more(page)
+    bubbles = sent_bubbles(page)
+    return bubbles[-1] if bubbles else None
 
 
 def plain(text):
@@ -319,16 +324,73 @@ def plain(text):
     return "".join(ch for ch in text if ch not in "*_~`" and not ch.isspace())
 
 
+def contact_key(contact):
+    """Same contact however it's written: "+20 10..." == "2010...", case-insensitive @usernames."""
+    contact = contact.strip().lower()
+    if contact.startswith("@"):
+        return contact
+    return "".join(ch for ch in contact if ch.isdigit())
+
+
+def message_id():
+    """Fingerprint of `message`, so the record knows WHICH message was sent."""
+    return hashlib.sha256(plain(normalize(message)).encode("utf-8")).hexdigest()[:16]
+
+
 def load_sent_contacts():
+    """Contacts that already got THIS message, from SENT_FILE."""
     if not os.path.exists(SENT_FILE):
         return set()
+    sent = set()
     with open(SENT_FILE, encoding='utf-8') as f:
-        return {line.strip() for line in f if line.strip()}
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[1] == message_id():
+                sent.add(contact_key(parts[0]))
+    return sent
 
 
 def mark_sent(contact):
     with open(SENT_FILE, 'a', encoding='utf-8') as f:
-        f.write(contact + "\n")
+        f.write(f"{contact}\t{message_id()}\t{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+def expand_read_more(page):
+    """WhatsApp cuts long messages short behind "Read more"; open them all."""
+    try:
+        links = page.locator("div.message-out").get_by_text(READ_MORE_PATTERN)
+        for i in range(min(links.count(), 20)):
+            try:
+                links.nth(i).click(timeout=2000)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def sent_bubbles(page):
+    """Texts of your sent messages visible in the open chat (newest last).
+    None if the chat's messages couldn't be read at all."""
+    for selector in SENT_BUBBLE_SELECTORS:
+        try:
+            bubbles = page.locator(selector)
+            count = bubbles.count()
+            if count:
+                return [normalize(bubbles.nth(i).inner_text(timeout=3000))
+                        for i in range(max(0, count - 30), count)]
+        except Exception:
+            pass
+    return None
+
+
+def already_in_chat(page):
+    """True if this exact message is already among your sent messages here."""
+    expand_read_more(page)
+    bubbles = sent_bubbles(page)
+    if not bubbles:
+        return False
+    wanted = plain(normalize(message))
+    return any(wanted in plain(bubble) for bubble in bubbles)
 
 
 def any_visible(page, selectors):
@@ -513,9 +575,13 @@ def type_message(page, box):
             page.keyboard.press("Shift+Enter")
 
 
+SENT, ALREADY_SENT, FAILED = "sent", "already sent", "failed"
+
+
 def send_message(page, contact):
     """Send the `message` variable to one contact (phone number or @username).
-    Returns True only once the message has actually left the compose box."""
+    Returns SENT only once the message has actually left the compose box,
+    ALREADY_SENT if the chat already has this exact message, else FAILED."""
     try:
         if contact.startswith("@"):
             url = f"https://web.whatsapp.com/send/?username={contact[1:]}&type=username"
@@ -526,8 +592,13 @@ def send_message(page, contact):
 
         box = get_message_box(page)
 
-        # Pause as if reading the chat before starting to type
-        time.sleep(random.uniform(1.5, 4.0))
+        # Pause as if reading the chat before starting to type (this also
+        # gives the chat history time to load for the check below)
+        time.sleep(random.uniform(2.5, 4.5))
+
+        if SKIP_ALREADY_SENT and already_in_chat(page):
+            write_log(f"↷ Skipped {contact}: this message is already in the chat")
+            return ALREADY_SENT
 
         # Make sure the box holds exactly `message` -- clear any leftover
         # draft first, and retype if anything came out wrong.
@@ -556,7 +627,7 @@ def send_message(page, contact):
         if DRY_RUN:
             write_log(f"✓ [DRY RUN] Message typed for {contact}, not sent")
             clear_box(page, box)
-            return True
+            return SENT
 
         box.press("Enter")
         if not wait_until_sent(box):
@@ -584,12 +655,12 @@ def send_message(page, contact):
                 write_log("  ⚠ the last sent bubble differs from the message -- check "
                           + proof_path(contact, ".txt"))
         write_log(f"✓ Sent to {contact}")
-        return True
+        return SENT
     except NotLoggedInError:
         raise
     except Exception as e:
         write_log(f"✗ Failed to send to {contact}: {e}")
-        return False
+        return FAILED
 
 
 def wait_until_sent(box, timeout=10):
@@ -608,14 +679,25 @@ def wait_until_sent(box, timeout=10):
 def main():
     """Main function - runs everything"""
     already_sent = load_sent_contacts() if SKIP_ALREADY_SENT else set()
-    pending = [c for c in CONTACTS if c not in already_sent]
+    pending, seen, duplicates = [], set(), 0
+    for contact in CONTACTS:
+        key = contact_key(contact)
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        if key not in already_sent:
+            pending.append(contact)
+    skipped_from_record = len(seen) - len(pending)
 
     write_log("=" * 50)
     write_log("WhatsApp Bulk Sender (Playwright) - Starting")
     write_log("=" * 50)
     write_log(f"Total contacts: {len(CONTACTS)}")
-    if already_sent:
-        write_log(f"Skipping {len(CONTACTS) - len(pending)} already sent (listed in {SENT_FILE})")
+    if duplicates:
+        write_log(f"Ignoring {duplicates} duplicate entr{'y' if duplicates == 1 else 'ies'} in CONTACTS")
+    if skipped_from_record:
+        write_log(f"Skipping {skipped_from_record} that already got this message (recorded in {SENT_FILE})")
     write_log(f"To send now: {len(pending)}")
     if DRY_RUN:
         write_log("DRY RUN: messages will be typed but NOT sent")
@@ -626,7 +708,7 @@ def main():
     write_log("=" * 50)
 
     if not pending:
-        write_log(f"Nothing to send. Delete {SENT_FILE} to send to everyone again.")
+        write_log("Nothing to send: every contact already got this message.")
         return
 
     if CONFIRM_BEFORE_SENDING:
@@ -646,15 +728,21 @@ def main():
             return
 
         success_count = 0
+        already_count = 0
         failed_contacts = []
 
         try:
             for i, contact in enumerate(pending, 1):
                 write_log(f"\n[{i}/{len(pending)}] Processing: {contact}")
-                if send_message(page, contact):
+                result = send_message(page, contact)
+                if result == SENT:
                     success_count += 1
                     if not DRY_RUN:
                         mark_sent(contact)
+                elif result == ALREADY_SENT:
+                    already_count += 1
+                    mark_sent(contact)
+                    continue  # nothing was sent, so no need to wait
                 else:
                     failed_contacts.append(contact)
 
@@ -679,6 +767,7 @@ def main():
         write_log("FINAL REPORT")
         write_log("=" * 50)
         write_log(f"✓ Successful: {success_count}")
+        write_log(f"↷ Already had this message (skipped): {skipped_from_record + already_count}")
         write_log(f"✗ Failed: {len(failed_contacts)}")
         if attempted:
             write_log(f"📊 Success Rate: {(success_count / attempted * 100):.1f}%")
