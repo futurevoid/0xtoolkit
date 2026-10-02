@@ -276,6 +276,39 @@ def write_log(entry):
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {entry}\n")
 
 
+# Reads text the way WhatsApp displays it: WhatsApp draws emoji as <img>
+# pictures (the emoji itself is in their alt text) and puts every line in its
+# own paragraph, so plain innerText would drop the emoji and add blank lines.
+READ_TEXT_JS = """el => {
+    const copy = el.cloneNode(true);
+    copy.querySelectorAll('img').forEach(img =>
+        img.replaceWith(document.createTextNode(img.alt || img.getAttribute('data-plain-text') || '')));
+    copy.querySelectorAll('br').forEach(br => br.replaceWith(document.createTextNode('\\n')));
+    copy.querySelectorAll('p, div').forEach(block => block.append(document.createTextNode('\\n')));
+    return copy.textContent;
+}"""
+
+# Invisible characters WhatsApp may add or drop (direction marks, emoji
+# variation selectors, zero-width joiners/spaces) -- ignored when comparing.
+INVISIBLE_CHARS = set("\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e"
+                      "\u2066\u2067\u2068\u2069\ufe0e\ufe0f\ufeff")
+
+
+def read_text(locator):
+    """Text of an element as displayed (emoji included), see READ_TEXT_JS."""
+    text = locator.evaluate(READ_TEXT_JS)
+    text = "".join(ch for ch in text if ch not in INVISIBLE_CHARS)
+    return "\n".join(line for line in normalize(text).split("\n") if line) if text.strip() else ""
+
+
+def first_difference(expected, actual):
+    """Short description of where two texts first differ (for the log)."""
+    a, b = plain(expected), plain(actual)
+    i = next((n for n in range(min(len(a), len(b))) if a[n] != b[n]), min(len(a), len(b)))
+    return (f"first difference at character {i}: expected ...{a[max(0, i - 15):i + 15]}... "
+            f"but the box has ...{b[max(0, i - 15):i + 15]}...")
+
+
 def normalize(text):
     """Collapse a message to its visible lines, so what's in the compose box
     can be compared with `message` regardless of how the editor stores
@@ -325,7 +358,8 @@ def last_sent_bubble_text(page):
 def plain(text):
     """Text without WhatsApp formatting marks (*bold* _italic_ ~strike~ `code`)
     or whitespace -- for comparing with what the chat bubble displays."""
-    return "".join(ch for ch in text if ch not in "*_~`" and not ch.isspace())
+    return "".join(ch for ch in text
+                   if ch not in "*_~`" and ch not in INVISIBLE_CHARS and not ch.isspace())
 
 
 def contact_key(contact):
@@ -380,7 +414,7 @@ def sent_bubbles(page):
             bubbles = page.locator(selector)
             count = bubbles.count()
             if count:
-                return [normalize(bubbles.nth(i).inner_text(timeout=3000))
+                return [read_text(bubbles.nth(i))
                         for i in range(max(0, count - 30), count)]
         except Exception:
             pass
@@ -563,7 +597,7 @@ def clear_box(page, box):
 
 
 def box_text(box):
-    return normalize(box.inner_text())
+    return read_text(box)
 
 
 def type_message(page, box):
@@ -607,16 +641,22 @@ def send_message(page, contact):
         # Make sure the box holds exactly `message` -- clear any leftover
         # draft first, and retype if anything came out wrong.
         expected = normalize(message)
+        # Compared ignoring line spacing, formatting marks and invisible
+        # characters, which WhatsApp's editor changes on its own.
         for attempt in range(1, 4):
             if box_text(box):
                 clear_box(page, box)
             type_message(page, box)
-            if box_text(box) == expected:
+            typed = box_text(box)
+            if plain(typed) == plain(expected):
                 break
-            write_log(f"  typed text didn't match the message (attempt {attempt}), retyping")
+            write_log(f"  typed text didn't match the message (attempt {attempt}): "
+                      + first_difference(expected, typed))
+            save_proof(page, contact, f"mismatch_attempt_{attempt}", typed)
         else:
             clear_box(page, box)
-            raise RuntimeError("couldn't type the message correctly, NOT sent")
+            raise RuntimeError("couldn't type the message correctly, NOT sent "
+                               f"(what was in the box is saved in {proof_path(contact, '.txt')})")
 
         # Links in the message make WhatsApp load a preview; give it time so
         # Enter isn't swallowed while it loads.
