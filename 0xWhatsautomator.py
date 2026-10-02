@@ -207,14 +207,25 @@ LOG_FILE = f"whatsapp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 INVALID_NUMBER_TEXTS = ["invalid", "غير صالح", "غير صحيح"]
 
 # Outgoing message bubbles in an open chat (to read back what was sent)
+# (each selector matches one element per message: the outermost text holder)
 SENT_BUBBLE_SELECTORS = [
-    'div.message-out span.selectable-text',
-    'div.message-out .copyable-text span',
+    'div.message-out div.copyable-text:not(div.copyable-text *)',
+    'div.message-out span.selectable-text:not(span.selectable-text *)',
     'div.message-out',
 ]
 
+# Any message row (yours or theirs), to know the chat history has loaded
+MESSAGE_ROW_SELECTOR = 'div.message-out, div.message-in'
+
+# How many of your latest sent messages in the chat are checked, and how long
+# to wait for the chat history to appear before checking.
+HISTORY_MESSAGES_TO_CHECK = 50
+HISTORY_LOAD_WAIT = 8  # seconds
+
 # The "Read more" link on long messages (English and Arabic interface)
-READ_MORE_PATTERN = re.compile(r"^\s*(read more|قراءة المزيد|اقرأ المزيد|عرض المزيد)\s*$", re.I)
+READ_MORE_WORDS = r"(read more|قراءة المزيد|اقرأ المزيد|عرض المزيد|المزيد)"
+READ_MORE_PATTERN = re.compile(READ_MORE_WORDS + r"\s*$", re.I)
+READ_MORE_LINK = re.compile(r"^\s*" + READ_MORE_WORDS + r"\s*$", re.I)
 
 # Something on screen that only exists once you're logged in (chat list etc.)
 LOGGED_IN_SELECTORS = [
@@ -284,7 +295,7 @@ READ_TEXT_JS = """el => {
     copy.querySelectorAll('img').forEach(img =>
         img.replaceWith(document.createTextNode(img.alt || img.getAttribute('data-plain-text') || '')));
     copy.querySelectorAll('br').forEach(br => br.replaceWith(document.createTextNode('\\n')));
-    copy.querySelectorAll('p, div').forEach(block => block.append(document.createTextNode('\\n')));
+    copy.querySelectorAll('p, div, li').forEach(block => block.append(document.createTextNode('\\n')));
     return copy.textContent;
 }"""
 
@@ -396,7 +407,7 @@ def mark_sent(contact):
 def expand_read_more(page):
     """WhatsApp cuts long messages short behind "Read more"; open them all."""
     try:
-        links = page.locator("div.message-out").get_by_text(READ_MORE_PATTERN)
+        links = page.locator("div.message-out").get_by_text(READ_MORE_LINK)
         for i in range(min(links.count(), 20)):
             try:
                 links.nth(i).click(timeout=2000)
@@ -407,28 +418,79 @@ def expand_read_more(page):
 
 
 def sent_bubbles(page):
-    """Texts of your sent messages visible in the open chat (newest last).
-    None if the chat's messages couldn't be read at all."""
+    """Texts of your latest sent messages in the open chat (newest last).
+    Empty list if none could be read."""
     for selector in SENT_BUBBLE_SELECTORS:
         try:
             bubbles = page.locator(selector)
             count = bubbles.count()
             if count:
                 return [read_text(bubbles.nth(i))
-                        for i in range(max(0, count - 30), count)]
+                        for i in range(max(0, count - HISTORY_MESSAGES_TO_CHECK), count)]
         except Exception:
             pass
-    return None
+    return []
 
 
-def already_in_chat(page):
-    """True if this exact message is already among your sent messages here."""
+def fingerprint(text):
+    """Only the letters and numbers of a message, in order. WhatsApp displays
+    list numbers ("1. "), emoji, formatting marks and spacing differently from
+    how they're typed, but never changes the words -- so two messages with the
+    same fingerprint are the same message, and a message with even one
+    different word or link is a different one."""
+    text = re.sub(r"(?m)^\s*(\d+[.)]|[-•])\s+", "", text)   # list markers
+    text = READ_MORE_PATTERN.sub("", text)
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def same_message(bubble_text):
+    """True if a chat bubble shows `message`. Also accepts a bubble WhatsApp
+    cut short behind "Read more" when its visible part is a long, exact start
+    of `message`."""
+    wanted, shown = fingerprint(normalize(message)), fingerprint(bubble_text)
+    if not shown:
+        return False
+    if wanted in shown:
+        return True
+    cut_short = bool(READ_MORE_PATTERN.search(bubble_text)) or bubble_text.rstrip().endswith("…")
+    return (cut_short and wanted.startswith(shown)
+            and len(shown) >= 150 and len(shown) >= 0.6 * len(wanted))
+
+
+def wait_for_history(page):
+    """Give the chat history time to appear (new chats have none)."""
+    deadline = time.time() + HISTORY_LOAD_WAIT
+    while time.time() < deadline:
+        try:
+            if page.locator(MESSAGE_ROW_SELECTOR).count():
+                time.sleep(1.5)  # let the rest of the visible history render
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
+def already_in_chat(page, contact):
+    """True if `message` is already among your latest sent messages here."""
+    wait_for_history(page)
     expand_read_more(page)
     bubbles = sent_bubbles(page)
-    if not bubbles:
-        return False
-    wanted = plain(normalize(message))
-    return any(wanted in plain(bubble) for bubble in bubbles)
+    if any(same_message(b) for b in bubbles):
+        return True
+    try:
+        rows = page.locator(MESSAGE_ROW_SELECTOR).count()
+    except Exception:
+        rows = 0
+    if bubbles:
+        write_log(f"  checked your last {len(bubbles)} sent message(s) in this chat: not sent before")
+        save_proof(page, contact, "chat_before_send",
+                   "\n----------\n".join(bubbles[-3:]))
+    elif rows:
+        write_log("  ⚠ the chat has messages but none of yours could be read -- "
+                  "relying on the sent record only")
+    else:
+        write_log("  new chat (no earlier messages)")
+    return False
 
 
 def any_visible(page, selectors):
@@ -634,7 +696,7 @@ def send_message(page, contact):
         # gives the chat history time to load for the check below)
         time.sleep(random.uniform(2.5, 4.5))
 
-        if SKIP_ALREADY_SENT and already_in_chat(page):
+        if SKIP_ALREADY_SENT and already_in_chat(page, contact):
             write_log(f"↷ Skipped {contact}: this message is already in the chat")
             return ALREADY_SENT
 
@@ -693,7 +755,7 @@ def send_message(page, contact):
             # The bubble shows formatting instead of the * _ ~ ` marks and adds
             # the time, so check it contains the whole message once those are
             # ignored.
-            if plain(expected) in plain(bubble):
+            if same_message(bubble):
                 write_log("  ✓ chat shows the exact message")
             else:
                 write_log("  ⚠ the last sent bubble differs from the message -- check "
