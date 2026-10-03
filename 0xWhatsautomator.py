@@ -108,6 +108,7 @@ SKIP_ALREADY_SENT = True
 # right-click the message box -> Inspect, and add the new selector to the front
 # of this list.
 MESSAGE_BOX_SELECTORS = [
+    'div[data-testid="conversation-compose-box-input"]',
     'div[contenteditable="true"][data-tab="10"]',
     'div[aria-placeholder="Type a message"]',
     'div[title="Type a message"]',
@@ -224,7 +225,9 @@ CHAT_MESSAGES_JS = """(limit) => {
         const row = n.closest('[data-id]');
         const id = row ? row.getAttribute('data-id') || '' : '';
         const out = id.startsWith('true_') || !!n.closest('.message-out');
-        return {text: read(n), out: out};
+        const text = read(n);
+        const key = id || ((n.getAttribute('data-pre-plain-text') || '') + text);
+        return {id: key, text: text, out: out};
     });
 }"""
 
@@ -244,6 +247,18 @@ HISTORY_LOAD_WAIT = 20  # seconds
 # WhatsApp only shows the newest few messages of a chat; the script scrolls up
 # until it has at least this many to check (or reaches the start of the chat).
 MIN_MESSAGES_TO_CHECK = 10
+
+# Scrolls the open chat's message list to the newest message.
+SCROLL_CHAT_DOWN_JS = """() => {
+    const root = document.querySelector('#main') || document.body;
+    let best = null;
+    for (const el of root.querySelectorAll('div')) {
+        const style = getComputedStyle(el);
+        if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 10 &&
+            (!best || el.scrollHeight > best.scrollHeight)) best = el;
+    }
+    if (best) { best.scrollTop = best.scrollHeight; best.dispatchEvent(new Event('scroll')); }
+}"""
 
 # Scrolls the open chat's message list (the tallest scrollable box in #main)
 # up by one screen. Returns "moved", "top" (already at the top -- WhatsApp is
@@ -403,17 +418,6 @@ def save_proof(page, contact, step, text):
         write_log(f"  (couldn't save proof: {str(e).splitlines()[0]})")
 
 
-def last_sent_bubble_text(page):
-    """Text of the newest message you sent in the open chat, or None."""
-    expand_read_more(page)
-    messages = chat_messages(page)
-    mine = [m["text"] for m in messages if m["out"]]
-    if mine:
-        return mine[-1]
-    # direction unknown: right after sending, the newest message is ours
-    return messages[-1]["text"] if messages else None
-
-
 def plain(text):
     """Text without WhatsApp formatting marks (*bold* _italic_ ~strike~ `code`)
     or whitespace -- for comparing with what the chat bubble displays."""
@@ -542,63 +546,72 @@ def wait_for_history(page):
     return False
 
 
-def load_older_messages(page):
-    """Scroll the chat up until at least MIN_MESSAGES_TO_CHECK messages are
-    loaded, or the start of the chat is reached."""
-    count = len(chat_messages(page))
+def scroll_chat_to_bottom(page):
+    try:
+        page.evaluate(SCROLL_CHAT_DOWN_JS)
+        time.sleep(1)
+    except Exception:
+        pass
+
+
+def already_in_chat(page, contact):
+    """True if `message` is already among the latest messages in this chat.
+
+    Starts with the newest messages, then scrolls up a screen at a time --
+    WhatsApp only keeps the messages near the screen, so every message seen on
+    the way is remembered -- until the message is found, MIN_MESSAGES_TO_CHECK
+    messages have been checked, or the start of the chat is reached. Leaves
+    the chat scrolled back to the newest message."""
+    wait_for_history(page)
+    scroll_chat_to_bottom(page)
+    seen = {}       # message id -> text (newest first)
     fruitless = 0
-    for _ in range(20):
-        if count >= MIN_MESSAGES_TO_CHECK:
-            return
+    found = False
+    for _ in range(25):
+        expand_read_more(page)
+        for m in reversed(chat_messages(page)):
+            if len(m["text"]) > len(seen.get(m["id"], "")):
+                seen[m["id"]] = m["text"]
+        # Any message in the chat counts, whoever sent it
+        if any(same_message(text) for text in seen.values()):
+            found = True
+            break
+        if len(seen) >= MIN_MESSAGES_TO_CHECK:
+            break
+        before = len(seen)
         try:
             where = page.evaluate(SCROLL_CHAT_UP_JS)
         except Exception:
             where = "none"
         # WhatsApp loads older messages as you scroll; give it up to 3s
         deadline = time.time() + 3
-        new_count = count
         while time.time() < deadline:
             time.sleep(0.5)
-            new_count = len(chat_messages(page))
-            if new_count > count:
+            if any(m["id"] not in seen for m in chat_messages(page)):
                 break
-        if new_count > count:
-            count, fruitless = new_count, 0
-        elif where in ("top", "none"):
-            return  # start of the chat (or nothing to scroll): all loaded
-        else:
+        if not any(m["id"] not in seen for m in chat_messages(page)):
+            if where in ("top", "none"):
+                break   # start of the chat (or nothing to scroll)
             fruitless += 1
             if fruitless >= 4:
-                return
+                break
+        else:
+            fruitless = 0
+    scroll_chat_to_bottom(page)
 
-
-def already_in_chat(page, contact):
-    """True if `message` is already among the latest messages in this chat."""
-    wait_for_history(page)
-    load_older_messages(page)
-    expand_read_more(page)
-    messages = chat_messages(page)
-    # Any message in the chat counts (not only ones marked as yours), so a
-    # missed "sent by you" marker can never cause a duplicate.
-    if any(same_message(m["text"]) for m in messages):
+    if found:
         return True
-    if messages:
-        mine = sum(1 for m in messages if m["out"])
-        write_log(f"  checked the last {len(messages)} message(s) in this chat "
-                  f"({mine} sent by you): this message wasn't sent before")
+    if seen:
+        write_log(f"  checked the last {len(seen)} message(s) in this chat: "
+                  "this message wasn't sent before")
         save_proof(page, contact, "chat_before_send",
-                   "\n----------\n".join(m["text"] for m in messages[-MIN_MESSAGES_TO_CHECK:]))
-        if len(messages) < MIN_MESSAGES_TO_CHECK or not mine:
-            # fewer than expected, or none recognised as yours: keep the page
-            # structure so the reading can be fixed for your WhatsApp version
-            dump_chat_dom(page, contact)
+                   "\n----------\n".join(list(seen.values())[:MIN_MESSAGES_TO_CHECK]))
     elif history_present(page):
         write_log("  ⚠ the chat has messages but they couldn't be read -- "
                   "relying on the sent record only")
         dump_chat_dom(page, contact)
     else:
         write_log("  no earlier messages found in this chat")
-        dump_chat_dom(page, contact)
     return False
 
 
@@ -784,6 +797,27 @@ def type_message(page, box):
             page.keyboard.press("Shift+Enter")
 
 
+def ensure_typed(page, box, contact):
+    """Type `message` into the box (clearing anything already there) and
+    check it came out right, retrying up to 3 times. Compared ignoring line
+    spacing, formatting marks and invisible characters, which WhatsApp's
+    editor changes on its own."""
+    expected = normalize(message)
+    for attempt in range(1, 4):
+        if box_text(box):
+            clear_box(page, box)
+        type_message(page, box)
+        typed = box_text(box)
+        if plain(typed) == plain(expected):
+            return
+        write_log(f"  typed text didn't match the message (attempt {attempt}): "
+                  + first_difference(expected, typed))
+        save_proof(page, contact, f"mismatch_attempt_{attempt}", typed)
+    clear_box(page, box)
+    raise RuntimeError("couldn't type the message correctly, NOT sent "
+                       f"(what was in the box is saved in {proof_path(contact, '.txt')})")
+
+
 SENT, ALREADY_SENT, FAILED = "sent", "already sent", "failed"
 
 
@@ -809,25 +843,7 @@ def send_message(page, contact):
             write_log(f"↷ Skipped {contact}: this message is already in the chat")
             return ALREADY_SENT
 
-        # Make sure the box holds exactly `message` -- clear any leftover
-        # draft first, and retype if anything came out wrong.
-        expected = normalize(message)
-        # Compared ignoring line spacing, formatting marks and invisible
-        # characters, which WhatsApp's editor changes on its own.
-        for attempt in range(1, 4):
-            if box_text(box):
-                clear_box(page, box)
-            type_message(page, box)
-            typed = box_text(box)
-            if plain(typed) == plain(expected):
-                break
-            write_log(f"  typed text didn't match the message (attempt {attempt}): "
-                      + first_difference(expected, typed))
-            save_proof(page, contact, f"mismatch_attempt_{attempt}", typed)
-        else:
-            clear_box(page, box)
-            raise RuntimeError("couldn't type the message correctly, NOT sent "
-                               f"(what was in the box is saved in {proof_path(contact, '.txt')})")
+        ensure_typed(page, box, contact)
 
         # Links in the message make WhatsApp load a preview; give it time so
         # Enter isn't swallowed while it loads.
@@ -837,6 +853,16 @@ def send_message(page, contact):
         # Pause as if reviewing the message before sending
         time.sleep(random.uniform(0.8, 2.5))
 
+        # Check again right before sending: never press Enter on an empty or
+        # wrong box (that would report a send that didn't happen)
+        if plain(box_text(box)) != plain(normalize(message)):
+            write_log("  the message box changed while waiting, retyping")
+            ensure_typed(page, box, contact)
+            if "http" in message:
+                time.sleep(LINK_PREVIEW_WAIT)
+            if plain(box_text(box)) != plain(normalize(message)):
+                raise RuntimeError("the message box keeps changing, NOT sent")
+
         save_proof(page, contact, "1_before_send", box_text(box))
 
         if DRY_RUN:
@@ -844,6 +870,7 @@ def send_message(page, contact):
             clear_box(page, box)
             return SENT
 
+        ids_before = {m["id"] for m in chat_messages(page)}
         box.press("Enter")
         if not wait_until_sent(box):
             for selector in SEND_BUTTON_SELECTORS:
@@ -854,21 +881,24 @@ def send_message(page, contact):
             if not wait_until_sent(box):
                 raise RuntimeError("message is still in the box after Enter and Send button")
 
-        # Let WhatsApp hand the message off before navigating away
-        time.sleep(2)
-        bubble = last_sent_bubble_text(page)
-        if bubble is None:
-            save_proof(page, contact, "2_sent", "(couldn't read the sent bubble from the chat)")
+        # The message left the box. Confirm a NEW bubble with it appeared
+        # (an older identical message in the chat doesn't count).
+        new_bubble = None
+        deadline = time.time() + 10
+        while time.time() < deadline and new_bubble is None:
+            time.sleep(1)
+            scroll_chat_to_bottom(page)
+            expand_read_more(page)
+            for m in chat_messages(page):
+                if m["id"] not in ids_before and same_message(m["text"]):
+                    new_bubble = m["text"]
+        if new_bubble is not None:
+            save_proof(page, contact, "2_sent", new_bubble)
+            write_log("  ✓ new message in the chat shows the exact text")
         else:
-            save_proof(page, contact, "2_sent", bubble)
-            # The bubble shows formatting instead of the * _ ~ ` marks and adds
-            # the time, so check it contains the whole message once those are
-            # ignored.
-            if same_message(bubble):
-                write_log("  ✓ chat shows the exact message")
-            else:
-                write_log("  ⚠ the last sent bubble differs from the message -- check "
-                          + proof_path(contact, ".txt"))
+            save_proof(page, contact, "2_sent", "(no new bubble with the message showed up within 10s)")
+            write_log("  ⚠ the message left the box but no new bubble with it showed up yet -- check "
+                      + proof_path(contact, ".txt"))
         write_log(f"✓ Sent to {contact}")
         return SENT
     except NotLoggedInError:
